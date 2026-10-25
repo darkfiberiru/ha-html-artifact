@@ -32,7 +32,7 @@ from .const import (
     STATIC_URL,
     VERSION,
 )
-from .assets import AssetStore
+from .assets import AssetStore, UploadTickets
 from .core import ArtifactError, ArtifactStore, TimerEngine
 from .http import async_register_http
 from .llm_api import ArtifactsAPI
@@ -51,6 +51,7 @@ class Runtime:
     notifier: TimerNotifier
     assets: AssetStore | None = None
     hass: HomeAssistant | None = None
+    uploads: UploadTickets = field(default_factory=UploadTickets)
     _asset_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
     def delete_artifact(self, artifact_id: str) -> None:

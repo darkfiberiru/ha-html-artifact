@@ -25,7 +25,7 @@ from custom_components.html_artifacts import Runtime, make_scheduler  # noqa: E4
 from custom_components.html_artifacts.const import CONF_LIVE, CONF_NOTIFY_TARGETS, DOMAIN, EVENT_FINISHED, EVENT_STEP  # noqa: E402
 from custom_components.html_artifacts.assets import AssetStore  # noqa: E402
 from custom_components.html_artifacts.core import ArtifactStore, TimerEngine  # noqa: E402
-from custom_components.html_artifacts.http import ArtifactListView, ArtifactView, AssetListView, AssetView  # noqa: E402
+from custom_components.html_artifacts.http import ArtifactListView, ArtifactView, AssetListView, AssetView, UploadView  # noqa: E402
 from custom_components.html_artifacts.llm_api import ArtifactsAPI  # noqa: E402
 from custom_components.html_artifacts.notifier import TimerNotifier  # noqa: E402
 from custom_components.html_artifacts.websocket_api import async_register_websocket  # noqa: E402
@@ -311,6 +311,30 @@ async def main():
     resp = await aview.delete(AReq(), "cook", "notes.txt")
     assert resp.status == 200
     ok("REST assets: get with ETag/304, put, delete, path validation, 404s")
+
+    # --- signed single-use upload URL (curl-style PUT, no auth header) ----------------------
+    hass.config.internal_url = "http://ha.lan:8123"
+    res = await tool("artifact_assets_upload_url", artifact_id="cook", zip=True, prefix="signed")
+    assert res["method"] == "PUT" and res["urls"][0].startswith("http://ha.lan:8123/api/html_artifacts/upload/"), res
+    token = res["path"].rsplit("/", 1)[1]
+    zbuf2 = io.BytesIO()
+    with zipfile.ZipFile(zbuf2, "w") as zf:
+        zf.writestr("big.bin", os.urandom(20000))
+    up = UploadView(hass)
+    assert up.requires_auth is False
+    resp = await up.put(AReq(zbuf2.getvalue()), token)
+    assert resp.status == 200 and b'"imported": 1' in resp.body.replace(b'"imported":1', b'"imported": 1'), resp.body[:200]
+    resp = await up.put(AReq(zbuf2.getvalue()), token)
+    assert resp.status == 403, "single use"
+    res = await tool("artifact_assets_upload_url", artifact_id="cook", path="one.txt", sha256=hashlib.sha256(b"right").hexdigest())
+    token = res["path"].rsplit("/", 1)[1]
+    resp = await up.put(AReq(b"wrong"), token)
+    assert resp.status == 400, resp.status
+    res = await tool("artifact_assets_upload_url", artifact_id="cook")
+    assert res["error"] == "invalid", res
+    files = (await tool("artifact_assets_list", artifact_id="cook"))["files"]
+    assert "signed/big.bin" in [f["path"] for f in files] and "one.txt" not in [f["path"] for f in files]
+    ok("signed upload URL: zip PUT without auth, single use, sha256 checked, needs path or zip")
 
     # --- REST views ----------------------------------------------------------------------
     class Req(dict):

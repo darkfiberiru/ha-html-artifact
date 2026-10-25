@@ -54,7 +54,7 @@ update, with release notes and an **Install** button. After installing, restart 
 **MCP (recommended).** Add HA's *Model Context Protocol Server* integration and select the
 **HTML Artifacts** API, then point Claude Desktop / Claude Code at it. Claude gets
 `artifact_authoring_guide`, `artifact_list`, `artifact_read`, `artifact_publish`, `artifact_kv_get/set`,
-`artifact_timer_list/create/control` and `artifact_assets_list/import`, `artifact_asset_put/delete`. If your MCP server setup only allows one API at a
+`artifact_timer_list/create/control` and `artifact_assets_list/import/upload_url`, `artifact_asset_put/delete`. If your MCP server setup only allows one API at a
 time, use REST below.
 
 **REST.** `PUT /api/html_artifacts/<id>` with a long-lived token (see `tools/publish.py`):
@@ -85,6 +85,10 @@ photos, 3D models, data) goes in the artifact's **asset files** instead:
 
 Getting files in, cheapest first (MCP):
 
+0. **Signed upload URL** (like Box's MCP pattern): `artifact_assets_upload_url` returns a single-use URL
+   (15 min by default, at most 60) bound to one file path or to a zip import. Wherever the file is, push it
+   with `curl -sS -X PUT --data-binary @file "<url>"`: no token, and the bytes never pass through the
+   conversation. `sha256` is checked on arrival if given.
 1. `artifact_assets_import` with `source: "inbox:<name>.zip"`: unzips a zip already in
    `<config>/html_artifacts/inbox/` (for example copied there over the Samba share). The data never passes
    through the conversation; the zip is removed after a successful import.

@@ -9,11 +9,15 @@
   GET    /api/html_artifacts/<id>/assets/<path>    file bytes (the page gets them through ha.assets)
   PUT    /api/html_artifacts/<id>/assets/<path>    upload a file (raw body; ?sha256= optional)
   DELETE /api/html_artifacts/<id>/assets/<path>    delete a file
+  PUT    /api/html_artifacts/upload/<token>        no auth header: a single-use URL from the
+                                                   artifact_assets_upload_url tool (file or zip)
 
 An update must carry the `base_version` that was read; a stale one gets a 409
 with the current content so the caller can merge hand edits before retrying.
 """
 from __future__ import annotations
+
+import hashlib
 
 from aiohttp import web
 
@@ -177,8 +181,44 @@ class AssetView(_Base):
         return self.json({})
 
 
+class UploadView(_Base):
+    """Signed-URL upload: the token is the credential (single use, expires)."""
+
+    url = "/api/html_artifacts/upload/{token}"
+    name = "api:html_artifacts:upload"
+    requires_auth = False
+
+    async def put(self, request: web.Request, token: str) -> web.Response:
+        try:
+            rt = self._runtime()
+            ticket = rt.uploads.take(token)
+            aid = ticket["artifact_id"]
+            if not rt.artifacts.exists(aid):
+                raise ArtifactError("not_found", f"artifact '{aid}' does not exist")
+            limit = ticket["max_bytes"]
+            if request.content_length and request.content_length > limit:
+                raise ArtifactError("too_large", f"upload is larger than {limit} bytes")
+            data = await request.content.read(limit + 1)
+            if len(data) > limit:
+                raise ArtifactError("too_large", f"upload is larger than {limit} bytes")
+            if ticket["mode"] == "file":
+                result = await rt.async_assets(rt.assets.put, aid, ticket["path"], data, sha256=ticket["sha256"])
+            else:
+                if ticket["sha256"] and hashlib.sha256(data).hexdigest() != ticket["sha256"]:
+                    raise ArtifactError("invalid", "zip sha256 mismatch: ask for a new URL and upload again")
+                result = await rt.async_assets(
+                    rt.assets.import_zip, aid, data, prefix=ticket["prefix"], replace=ticket["replace"]
+                )
+        except ArtifactError as err:
+            return self._fail(err)
+        return self.json(result)
+
+    post = put
+
+
 def async_register_http(hass: HomeAssistant) -> None:
     hass.http.register_view(ArtifactListView(hass))
     hass.http.register_view(ArtifactView(hass))
     hass.http.register_view(AssetListView(hass))
     hass.http.register_view(AssetView(hass))
+    hass.http.register_view(UploadView(hass))

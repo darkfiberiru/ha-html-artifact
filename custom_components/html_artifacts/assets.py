@@ -21,12 +21,14 @@ import io
 import json
 import os
 import re
+import secrets
 import shutil
 import stat
+import time
 import uuid
 import zipfile
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Callable
 
 from .core import SLUG_RE, ArtifactError
 
@@ -72,6 +74,10 @@ CONTENT_TYPES = {
     ".3mf": "model/3mf",
     ".bin": "application/octet-stream",
 }
+
+UPLOAD_TTL_DEFAULT = 15 * 60
+UPLOAD_TTL_MAX = 60 * 60
+MAX_TICKETS = 100
 
 _INDEX = ".index.json"
 _STAGING = ".staging"
@@ -397,3 +403,71 @@ class AssetStore:
             "total_bytes": sum(m["size"] for m in kept.values()),
             "count": len(kept),
         }
+
+
+class UploadTickets:
+    """Single-use, short-lived upload URLs (the "signed URL" pattern).
+
+    An MCP tool issues a ticket bound to one artifact and one target (a file
+    path, or a zip to import); the caller then PUTs the bytes straight to
+    /api/html_artifacts/upload/<token> (e.g. with curl), so a large file never
+    passes through the model's context. Tickets live in memory only.
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.time) -> None:
+        self._clock = clock
+        self._tickets: dict[str, dict[str, Any]] = {}
+
+    def _prune(self) -> None:
+        now = self._clock()
+        for token in [t for t, v in self._tickets.items() if v["expires_at"] <= now]:
+            del self._tickets[token]
+
+    def issue(
+        self,
+        artifact_id: str,
+        *,
+        mode: str,
+        path: str | None = None,
+        prefix: str = "",
+        replace: bool = False,
+        sha256: str | None = None,
+        ttl: float = UPLOAD_TTL_DEFAULT,
+    ) -> dict[str, Any]:
+        if not isinstance(artifact_id, str) or not SLUG_RE.match(artifact_id):
+            raise ArtifactError("invalid", "bad artifact id")
+        if mode == "file":
+            path = clean_path(path)
+            max_bytes = MAX_FILE_BYTES
+        elif mode == "zip":
+            path = None
+            max_bytes = MAX_TOTAL_BYTES * 2
+        else:
+            raise ArtifactError("invalid", "mode must be 'file' or 'zip'")
+        if sha256 is not None and not re.fullmatch(r"[0-9a-fA-F]{64}", sha256):
+            raise ArtifactError("invalid", "sha256 must be 64 hex digits")
+        ttl = max(60.0, min(float(ttl), UPLOAD_TTL_MAX))
+        self._prune()
+        if len(self._tickets) >= MAX_TICKETS:
+            raise ArtifactError("limit", f"at most {MAX_TICKETS} open upload URLs")
+        token = secrets.token_urlsafe(32)
+        ticket = {
+            "artifact_id": artifact_id,
+            "mode": mode,
+            "path": path,
+            "prefix": prefix or "",
+            "replace": bool(replace),
+            "sha256": sha256.lower() if sha256 else None,
+            "max_bytes": max_bytes,
+            "expires_at": self._clock() + ttl,
+        }
+        self._tickets[token] = ticket
+        return {"token": token, **ticket}
+
+    def take(self, token: str) -> dict[str, Any]:
+        """Use up a ticket. Unknown, used and expired tickets all look the same."""
+        self._prune()
+        ticket = self._tickets.pop(token, None) if isinstance(token, str) else None
+        if ticket is None:
+            raise ArtifactError("forbidden", "upload URL is unknown, used or expired: ask for a new one")
+        return ticket

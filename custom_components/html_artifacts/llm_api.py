@@ -15,6 +15,7 @@ import voluptuous as vol
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import llm
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.network import NoURLAvailableError, get_url
 from homeassistant.util.json import JsonObjectType
 
 from .const import DOMAIN, LLM_API_ID
@@ -92,6 +93,10 @@ ASSET FILES (per artifact, on the HA server, not versioned)
   fonts, pdf, stl/obj/glb/gltf/3mf/bin. Limits: 8 MB per file, 64 MB and 1000
   files per artifact. Publish the page first; assets belong to an existing artifact.
   Uploading, cheapest first:
+  0. artifact_assets_upload_url: a single-use, short-lived URL for one file (path)
+     or one zip (zip=true). If you can run a command where the file is, push it
+     yourself: curl -sS -X PUT --data-binary @file "<url>". No token needed, and
+     the bytes never pass through the conversation.
   1. artifact_assets_import with source "inbox:<name>.zip": a zip already placed in
      <config>/html_artifacts/inbox/ (e.g. copied there over a shared folder). The
      data never passes through the conversation.
@@ -393,6 +398,65 @@ class AssetsImportTool(_Tool):
         return result
 
 
+class AssetsUploadUrlTool(_Tool):
+    name = "artifact_assets_upload_url"
+    description = (
+        "Get a single-use, short-lived URL to upload one asset file (give 'path') or one zip of "
+        "assets (zip=true, optional prefix/replace) with a plain HTTP PUT, e.g. "
+        "curl -sS -X PUT --data-binary @file \"<url>\". The bytes go straight to Home Assistant, "
+        "not through the conversation. Optional sha256 is checked on arrival."
+    )
+    parameters = vol.Schema(
+        {
+            vol.Required("artifact_id"): str,
+            vol.Optional("path"): str,
+            vol.Optional("zip"): bool,
+            vol.Optional("prefix"): str,
+            vol.Optional("replace"): bool,
+            vol.Optional("sha256"): str,
+            vol.Optional("expires_minutes"): vol.Coerce(float),
+        }
+    )
+
+    @_guard
+    async def async_call(self, hass, tool_input, llm_context) -> JsonObjectType:
+        args = tool_input.tool_args
+        rt = _rt(hass)
+        aid = args["artifact_id"]
+        _need_artifact(rt, aid)
+        zipped = bool(args.get("zip"))
+        if not zipped and not args.get("path"):
+            raise ArtifactError("invalid", "give 'path' for a single file, or zip=true for a zip")
+        ticket = rt.uploads.issue(
+            aid,
+            mode="zip" if zipped else "file",
+            path=args.get("path"),
+            prefix=args.get("prefix", ""),
+            replace=bool(args.get("replace")),
+            sha256=args.get("sha256"),
+            ttl=float(args.get("expires_minutes", 15)) * 60,
+        )
+        path = f"/api/html_artifacts/upload/{ticket['token']}"
+        urls = []
+        for kwargs in ({"allow_external": False}, {"allow_internal": False}):
+            try:
+                base = get_url(hass, **kwargs)
+            except NoURLAvailableError:
+                continue
+            if base + path not in urls:
+                urls.append(base + path)
+        return {
+            "method": "PUT",
+            "path": path,
+            "urls": urls,
+            "expires_at": ticket["expires_at"],
+            "max_bytes": ticket["max_bytes"],
+            "single_use": True,
+            "target": ticket["path"] if ticket["mode"] == "file" else "zip import",
+            "example": f'curl -sS -X PUT --data-binary @<file> "{(urls or [path])[0]}"',
+        }
+
+
 class AssetDeleteTool(_Tool):
     name = "artifact_asset_delete"
     description = "Delete one asset file of an artifact, or all of them with path '*'."
@@ -441,6 +505,6 @@ class ArtifactsAPI(llm.API):
         tools: list[llm.Tool] = [
             GuideTool(), ListTool(), ReadTool(), PublishTool(), KvGetTool(), KvSetTool(),
             TimerListTool(), TimerCreateTool(), TimerControlTool(),
-            AssetsListTool(), AssetPutTool(), AssetsImportTool(), AssetDeleteTool(),
+            AssetsListTool(), AssetsUploadUrlTool(), AssetPutTool(), AssetsImportTool(), AssetDeleteTool(),
         ]
         return llm.APIInstance(api=self, api_prompt=SHORT_PROMPT, llm_context=llm_context, tools=tools)

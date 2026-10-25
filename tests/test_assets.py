@@ -179,5 +179,39 @@ class AssetStoreTest(unittest.TestCase):
         self.assertEqual(self.code(self.store.inbox_file, "vent.tar"), "invalid")
 
 
+class UploadTicketsTest(unittest.TestCase):
+    def setUp(self):
+        self.now = 1000.0
+        self.t = assets.UploadTickets(clock=lambda: self.now)
+
+    def test_single_use_and_bound(self):
+        tk = self.t.issue("vent", mode="file", path="img/a.png", sha256="ab" * 32)
+        self.assertEqual((tk["mode"], tk["path"], tk["max_bytes"]), ("file", "img/a.png", assets.MAX_FILE_BYTES))
+        self.assertGreaterEqual(len(tk["token"]), 40)
+        got = self.t.take(tk["token"])
+        self.assertEqual(got["artifact_id"], "vent")
+        with self.assertRaises(ArtifactError) as ctx:
+            self.t.take(tk["token"])
+        self.assertEqual(ctx.exception.code, "forbidden")
+
+    def test_expiry_clamped_and_enforced(self):
+        tk = self.t.issue("vent", mode="zip", ttl=5)  # clamped up to 60 s
+        self.assertEqual(tk["expires_at"], 1060.0)
+        self.now = 1061.0
+        with self.assertRaises(ArtifactError):
+            self.t.take(tk["token"])
+        tk = self.t.issue("vent", mode="zip", ttl=99999)
+        self.assertEqual(tk["expires_at"], self.now + assets.UPLOAD_TTL_MAX)
+
+    def test_validation(self):
+        for kwargs in ({"mode": "file"}, {"mode": "file", "path": "../x.png"}, {"mode": "dir"},
+                       {"mode": "zip", "sha256": "xyz"}):
+            with self.subTest(kwargs):
+                with self.assertRaises(ArtifactError):
+                    self.t.issue("vent", **kwargs)
+        with self.assertRaises(ArtifactError):
+            self.t.issue("../bad", mode="zip")
+
+
 if __name__ == "__main__":
     unittest.main()
