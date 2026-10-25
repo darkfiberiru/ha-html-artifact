@@ -52,8 +52,8 @@ update, with release notes and an **Install** button. After installing, restart 
 
 **MCP (recommended).** Add HA's *Model Context Protocol Server* integration and select the
 **HTML Artifacts** API, then point Claude Desktop / Claude Code at it. Claude gets
-`artifact_authoring_guide`, `artifact_list`, `artifact_read`, `artifact_publish`, `artifact_kv_get/set`
-and `artifact_timer_list/create/control`. If your MCP server setup only allows one API at a
+`artifact_authoring_guide`, `artifact_list`, `artifact_read`, `artifact_publish`, `artifact_patch`, `artifact_check`,
+`artifact_kv_get/set` and `artifact_timer_list/create/control`. If your MCP server setup only allows one API at a
 time, use REST below.
 
 **REST.** `PUT /api/html_artifacts/<id>` with a long-lived token (see `tools/publish.py`):
@@ -63,6 +63,20 @@ export HA_URL=http://homeassistant.local:8123 HA_TOKEN=...
 tools/publish.py pesto-tilapia examples/cook-timer.html --title "Pesto Tilapia" --caps '{"notify": true}'
 tools/publish.py house-board  examples/house-board.html --caps '{"entities":["sensor.*temperature*","light.*"],"services":["light.toggle"]}'
 ```
+
+**Small changes, cheap checks.** Claude doesn't have to resend a whole page to change a line:
+
+- `artifact_patch`: find/replace edits `[{old_str, new_str}]`, each `old_str` must match exactly once, all-or-nothing, applied
+  against the `base_version` Claude read (REST: `PATCH /api/html_artifacts/<id>`). Ambiguous or missing matches are errors, never guesses.
+- `artifact_read` with `metadata_only` (REST: `GET ...?metadata=1`) returns just version, size and capabilities. `artifact_list` also shows each page's size.
+- `artifact_check` is a **render check**. Publish and patch already return `lint` (things the sandbox blocks, such as `localStorage`, external scripts
+  or `fetch` without the network permission). `artifact_check` adds what a real browser saw: uncaught errors, unhandled promise rejections,
+  `console.error` output and requests blocked by the security policy, with line numbers in the page's own html.
+  Home Assistant can't run a browser, so it borrows yours: when a new version is saved, one open Home Assistant tab (any dashboard, or the companion app)
+  renders it in a hidden frame and reports back; the tool waits up to 20 seconds. If nothing is open it answers `pending`.
+  The hidden frame is **side-effect free**: its `window.ha` calls are answered by stubs, so a freshly published page can't call services, send notifications,
+  write state or start timers. Data-dependent behavior (entity values, existing state) therefore still needs a human look.
+  Pages someone is already viewing report on their own. Opt a browser out with `localStorage.setItem("html_artifacts:dry_run", "off")`.
 
 **Hand edits and Claude edits don't clobber each other.** Updating an existing artifact requires
 the `base_version` that was read. If you edited the page in the meantime, the publish is refused
@@ -146,12 +160,12 @@ shared by the household.
 ## Development and what has been verified
 
 ```bash
-python -m unittest discover -s tests -v               # core logic + updater, no HA needed (41 tests)
-node tests/frontend_check.js                          # bridge protocol, CSP, helpers (15 checks)
+python -m unittest discover -s tests -v               # core logic, updater, patch/lint/reports; no HA needed (57 tests)
+node tests/frontend_check.js                          # bridge protocol, CSP, error capture, line mapping, dry-run stubs (19 checks)
 NODE_PATH=<jsdom>/node_modules node tests/example_pages.js   # example pages in jsdom through the real bridge
 <venv-with-homeassistant>/bin/python tests/smoke_ha.py        # real HA 2026.2: websocket, MCP tools, REST, notifications
 <venv-with-homeassistant>/bin/python tests/smoke_update.py    # real HA: update entity (GitHub faked)
-python tests/panel_layout.py [--shots DIR]                    # real Chromium (pip install playwright): panel modes, sizing, card + visual editor
+python tests/panel_layout.py [--shots DIR]                    # real Chromium (pip install playwright): panel modes, sizing, card + visual editor, render check
 ```
 
 Verified against Home Assistant 2026.2.3: all modules import; websocket commands, the MCP tools
