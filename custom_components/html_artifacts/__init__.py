@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from homeassistant.components import frontend, panel_custom
@@ -30,7 +30,7 @@ from .const import (
     STATIC_URL,
     VERSION,
 )
-from .core import ArtifactError, ArtifactStore, TimerEngine
+from .core import ArtifactError, ArtifactStore, RenderReports, TimerEngine
 from .http import async_register_http
 from .llm_api import ArtifactsAPI
 from .notifier import TimerNotifier
@@ -46,10 +46,12 @@ class Runtime:
     artifacts: ArtifactStore
     timers: TimerEngine
     notifier: TimerNotifier
+    reports: RenderReports = field(default_factory=RenderReports)
 
     def delete_artifact(self, artifact_id: str) -> None:
         self.artifacts.delete(artifact_id)
         self.timers.delete_for_artifact(artifact_id)
+        self.reports.forget(artifact_id)
 
 
 def make_scheduler(hass: HomeAssistant):

@@ -127,6 +127,165 @@ def _clean_str(value: Any, limit: int, what: str, allow_empty: bool = False) -> 
 
 
 # --------------------------------------------------------------------------
+# Find/replace edits
+# --------------------------------------------------------------------------
+
+MAX_EDITS = 64
+
+
+def apply_edits(html: str, edits: Any) -> str:
+    """Apply [{old_str, new_str}, ...] in order; each old_str must match exactly once.
+
+    The same contract as a code editor's find/replace tool: ambiguous or missing
+    matches are errors (so a slip never silently edits the wrong place), and the
+    result is all-or-nothing because the caller only sees the final string.
+    """
+    if not isinstance(edits, list) or not edits:
+        raise ArtifactError("invalid", "edits must be a non-empty list of {old_str, new_str}")
+    if len(edits) > MAX_EDITS:
+        raise ArtifactError("invalid", f"at most {MAX_EDITS} edits per patch")
+    for index, edit in enumerate(edits, 1):
+        if not isinstance(edit, dict):
+            raise ArtifactError("invalid", f"edit {index} must be an object with old_str and new_str")
+        old, new = edit.get("old_str"), edit.get("new_str")
+        if not isinstance(old, str) or not isinstance(new, str):
+            raise ArtifactError("invalid", f"edit {index} needs string old_str and new_str")
+        if old == "":
+            raise ArtifactError("invalid", f"edit {index}: old_str must not be empty")
+        if old == new:
+            raise ArtifactError("invalid", f"edit {index}: old_str and new_str are identical")
+        count = html.count(old)
+        if count != 1:
+            head = old.strip().splitlines()[0][:60] if old.strip() else repr(old[:30])
+            raise ArtifactError(
+                "edit_failed",
+                f"edit {index}: old_str matched {count} times (it must match exactly once); "
+                f"starts with: {head!r}. "
+                + ("Add surrounding text to make it unique." if count else "Check whitespace and quotes against artifact_read."),
+                edit=index,
+                matches=count,
+            )
+        html = html.replace(old, new, 1)
+    return html
+
+
+# --------------------------------------------------------------------------
+# Static lint: things that will not work inside the sandbox, found without a browser
+# --------------------------------------------------------------------------
+
+_SCRIPT_HOSTS = ("cdnjs.cloudflare.com", "cdn.jsdelivr.net", "unpkg.com")
+_STYLE_HOSTS = ("fonts.googleapis.com", "cdnjs.cloudflare.com")
+
+
+def _host(url: str) -> str:
+    match = re.match(r"https?://([^/:?#]+)", url, re.I)
+    return match.group(1).lower() if match else ""
+
+
+def lint_html(html: str, caps_requested: Any = None) -> list[dict[str, str]]:
+    """Heuristic warnings; they never block a publish. Each is {level, code, message}."""
+    out: list[dict[str, str]] = []
+    wants_network = bool((caps_requested or {}).get("network"))
+
+    def add(level: str, code: str, message: str) -> None:
+        out.append({"level": level, "code": code, "message": message})
+
+    code_only = re.sub(r"<!--.*?-->", "", html, flags=re.S)
+    if re.search(r"\b(localStorage|sessionStorage|indexedDB)\b|document\.cookie", code_only):
+        add("warning", "storage",
+            "localStorage, sessionStorage, indexedDB and cookies throw in the sandbox (no same-origin). "
+            "Use ha.kv for state that must survive.")
+    if re.search(r"\bfetch\s*\(|XMLHttpRequest|new\s+WebSocket|new\s+EventSource", code_only) and not wants_network:
+        add("warning", "network",
+            "fetch/XHR/WebSocket are blocked unless the page requests the 'network' capability "
+            "and the user approves it.")
+    for tag in re.findall(r"<script\b[^>]*\bsrc\s*=\s*[\"']?(https?://[^\"'\s>]+)", code_only, re.I):
+        if _host(tag) not in _SCRIPT_HOSTS:
+            add("error", "script_src",
+                f"script {tag} is blocked: external scripts are only allowed from "
+                "cdnjs.cloudflare.com, cdn.jsdelivr.net and unpkg.com.")
+    for tag in re.findall(r"<link\b[^>]*\bhref\s*=\s*[\"']?(https?://[^\"'\s>]+)", code_only, re.I):
+        if _host(tag) not in _STYLE_HOSTS and not re.search(r"fonts\.gstatic\.com", tag):
+            add("error", "link_href",
+                f"{tag} is blocked: external styles are only allowed from fonts.googleapis.com "
+                "and cdnjs.cloudflare.com.")
+    if not wants_network and re.search(r"<(img|video|audio|source)\b[^>]*\bsrc\s*=\s*[\"']?https?://", code_only, re.I):
+        add("warning", "external_media",
+            "external images/media are blocked without the 'network' capability; embed them as data: URIs.")
+    if re.search(r"\bwindow\.open\s*\(|target\s*=\s*[\"']?_blank", code_only):
+        add("warning", "popup", "popups and target=_blank links are blocked in the sandbox.")
+    if re.search(r"\bha\.(kv|timers|entities|callService|notify)\b", code_only) and not re.search(r"\bha\.ready\b", code_only):
+        add("warning", "ha_ready", "the page uses window.ha but never awaits ha.ready.")
+    if code_only.lower().count("<script") != code_only.lower().count("</script"):
+        add("error", "script_tag", "unbalanced <script> tags: the page's JavaScript will not run as written.")
+    if not re.search(r"<meta[^>]+name\s*=\s*[\"']?viewport", code_only, re.I):
+        add("info", "viewport", 'no <meta name="viewport">: the page will render zoomed-out on phones.')
+    return out
+
+
+# --------------------------------------------------------------------------
+# Render reports: what real browsers saw when they ran an artifact
+# --------------------------------------------------------------------------
+
+MAX_REPORT_ERRORS = 30
+
+
+class RenderReports(_Listeners):
+    """Latest render outcome per artifact, for the current version only (memory, not persisted)."""
+
+    def __init__(self, clock: Callable[[], float] = time.time) -> None:
+        super().__init__()
+        self._clock = clock
+        self._data: dict[str, dict[str, Any]] = {}
+
+    def add(
+        self,
+        artifact_id: str,
+        version: int,
+        *,
+        source: str,
+        settled: bool,
+        errors: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        report = self._data.get(artifact_id)
+        if report is None or report["version"] != version:
+            report = {"version": version, "renders": 0, "settled": False, "sources": [], "errors": [], "updated": 0.0}
+            self._data[artifact_id] = report
+        if settled:
+            report["renders"] += 1
+            report["settled"] = True
+        if source not in report["sources"]:
+            report["sources"].append(source)
+        seen = {(e["level"], e["message"]) for e in report["errors"]}
+        for raw in errors or []:
+            if not isinstance(raw, dict):
+                continue
+            entry = {
+                "level": str(raw.get("level") or "error")[:20],
+                "message": str(raw.get("message") or "")[:500],
+            }
+            if isinstance(raw.get("line"), int) and raw["line"] > 0:
+                entry["line"] = raw["line"]
+            key = (entry["level"], entry["message"])
+            if key in seen or not entry["message"] or len(report["errors"]) >= MAX_REPORT_ERRORS:
+                continue
+            seen.add(key)
+            report["errors"].append(entry)
+        report["updated"] = self._clock()
+        self._emit({"type": "render_report", "artifact_id": artifact_id, "version": version})
+        return self.summary(artifact_id, version) or {}
+
+    def summary(self, artifact_id: str, version: int) -> dict[str, Any] | None:
+        report = self._data.get(artifact_id)
+        if report is None or report["version"] != version:
+            return None
+        return copy.deepcopy(report)
+
+    def forget(self, artifact_id: str) -> None:
+        self._data.pop(artifact_id, None)
+
+
+# --------------------------------------------------------------------------
 # Artifact store
 # --------------------------------------------------------------------------
 
@@ -158,7 +317,9 @@ class ArtifactStore(_Listeners):
             "id", "title", "description", "icon", "version", "created",
             "updated", "updated_by", "source", "caps_requested", "caps_granted",
         )
-        return copy.deepcopy({key: artifact[key] for key in keys})
+        out = copy.deepcopy({key: artifact[key] for key in keys})
+        out["size"] = len(artifact["html"].encode("utf-8"))
+        return out
 
     def _require(self, artifact_id: str) -> dict:
         artifact = self._data["artifacts"].get(artifact_id)
@@ -168,6 +329,10 @@ class ArtifactStore(_Listeners):
 
     def exists(self, artifact_id: str) -> bool:
         return artifact_id in self._data["artifacts"]
+
+    def version_of(self, artifact_id: str) -> int | None:
+        artifact = self._data["artifacts"].get(artifact_id)
+        return artifact["version"] if artifact else None
 
     def list(self) -> list[dict]:
         items = [self.summary(a) for a in self._data["artifacts"].values()]
@@ -305,6 +470,52 @@ class ArtifactStore(_Listeners):
         self._save()
         self._emit({"type": "artifact", "change": "save", "artifact": self.summary(artifact)})
         return self.get(artifact_id)
+
+    def patch(
+        self,
+        artifact_id: str,
+        edits: Any,
+        *,
+        base_version: int | None,
+        title: str | None = None,
+        description: str | None = None,
+        icon: str | None = None,
+        caps_requested: Any = None,
+        source: str = "user",
+        updated_by: str | None = None,
+    ) -> dict:
+        """Apply find/replace edits to the current html and save the result as a new version.
+
+        The edits are checked against the version the caller read (`base_version`), never
+        against whatever is stored now, so a hand edit in between is a conflict instead of
+        a silent mis-application. All edits apply or none do.
+        """
+        current = self._require(artifact_id)
+        if base_version is None:
+            raise ArtifactError(
+                "conflict",
+                "pass the base_version you read (artifact_read with metadata_only is enough)",
+                current=self.summary(current),
+            )
+        if base_version != current["version"]:
+            raise ArtifactError(
+                "conflict",
+                f"artifact is at version {current['version']} (edited by "
+                f"{current['updated_by']}); your edits are based on {base_version}",
+                current=self.get(artifact_id),
+            )
+        html = apply_edits(current["html"], edits)
+        return self.save(
+            artifact_id,
+            html,
+            title=title,
+            description=description,
+            icon=icon,
+            base_version=base_version,
+            caps_requested=caps_requested,
+            source=source,
+            updated_by=updated_by,
+        )
 
     def revert(self, artifact_id: str, version: int, updated_by: str = "user") -> dict:
         artifact = self._require(artifact_id)

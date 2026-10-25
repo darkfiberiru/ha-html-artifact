@@ -2,7 +2,9 @@
 
   GET    /api/html_artifacts              list
   GET    /api/html_artifacts/<id>         read (includes html and version)
+  GET    /api/html_artifacts/<id>?metadata=1   version, size, capabilities only (no html)
   PUT    /api/html_artifacts/<id>         publish {html, base_version?, title?, description?, icon?, capabilities?}
+  PATCH  /api/html_artifacts/<id>         {base_version, edits: [{old_str, new_str}], title?, ...}: find/replace edits
   DELETE /api/html_artifacts/<id>         delete (admin)
 
 An update must carry the `base_version` that was read; a stale one gets a 409
@@ -24,6 +26,7 @@ _STATUS = {
     "too_large": 413,
     "forbidden": 403,
     "invalid": 400,
+    "edit_failed": 422,
     "limit": 400,
 }
 
@@ -64,9 +67,37 @@ class ArtifactView(_Base):
 
     async def get(self, request: web.Request, artifact_id: str) -> web.Response:
         try:
-            return self.json(self._runtime().artifacts.get(artifact_id))
+            artifact = self._runtime().artifacts.get(artifact_id)
         except ArtifactError as err:
             return self._fail(err)
+        if request.query.get("metadata") in ("1", "true"):
+            artifact.pop("html", None)
+        return self.json(artifact)
+
+    async def patch(self, request: web.Request, artifact_id: str) -> web.Response:
+        try:
+            body = await request.json()
+        except ValueError:
+            return self.json({"error": "invalid", "message": "body must be JSON"}, status_code=400)
+        if not isinstance(body, dict) or "edits" not in body:
+            return self.json({"error": "invalid", "message": "body needs an 'edits' field"}, status_code=400)
+        user = request.get("hass_user")
+        try:
+            result = self._runtime().artifacts.patch(
+                artifact_id,
+                body["edits"],
+                base_version=body.get("base_version"),
+                title=body.get("title"),
+                description=body.get("description"),
+                icon=body.get("icon"),
+                caps_requested=body.get("capabilities"),
+                source="api",
+                updated_by=f"api:{user.name}" if user else "api",
+            )
+        except ArtifactError as err:
+            return self._fail(err)
+        result.pop("html", None)
+        return self.json(result)
 
     async def put(self, request: web.Request, artifact_id: str) -> web.Response:
         try:

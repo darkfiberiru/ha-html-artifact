@@ -6,6 +6,8 @@ artifacts. The same code backs the REST API in http.py.
 """
 from __future__ import annotations
 
+import asyncio
+
 import voluptuous as vol
 
 from homeassistant.core import HomeAssistant
@@ -13,7 +15,7 @@ from homeassistant.helpers import llm
 from homeassistant.util.json import JsonObjectType
 
 from .const import DOMAIN, LLM_API_ID
-from .core import ArtifactError
+from .core import ArtifactError, lint_html
 
 AUTHORING_GUIDE = """\
 HTML ARTIFACTS FOR HOME ASSISTANT - AUTHORING GUIDE
@@ -25,13 +27,24 @@ checklists, dashboards, kitchen displays, planners, games. Unlike a normal
 artifact, it can keep state on the server and use `window.ha` (below).
 
 WORKFLOW
-1. artifact_list, then artifact_read before changing anything. The result has a
-   `version`.
-2. artifact_publish with the full html and `base_version` set to the version you
-   read. New artifacts need no base_version. If the user edited the page in the
-   meantime you get error "conflict" with the current html: merge their changes
-   into yours and publish again. Never overwrite blindly.
-3. Declare what the page needs in `capabilities`; the user approves it in the
+1. artifact_list (ids, versions, sizes, capabilities), then artifact_read before
+   changing anything. artifact_read with metadata_only=true returns just the
+   version, size and capabilities, without the html, when you only need the version.
+2. New page: artifact_publish with the full html. Changing an existing page:
+   prefer artifact_patch with find/replace edits (old_str must match exactly once;
+   all edits apply or none do) and base_version set to the version you read: you
+   resend only what changed. Use artifact_publish with the full html for rewrites.
+   If the user edited the page in the meantime you get error "conflict" with the
+   current html: re-read, merge their changes into yours and try again. Never
+   overwrite blindly.
+3. Check your work: publish and patch return `lint` warnings (things the sandbox
+   will block, such as localStorage or external scripts). Then call artifact_check:
+   a real browser renders the new version in a hidden, side-effect-free frame
+   (no service calls, notifications or timers) and reports JavaScript errors,
+   console errors and blocked requests with line numbers. If it says "pending",
+   no browser had Home Assistant open: ask the user to open it, or retry later.
+   Fix what it reports with artifact_patch, then check again.
+4. Declare what the page needs in `capabilities`; the user approves it in the
    panel. Until then the page runs without those powers:
    {"entities": ["sensor.oven_*"], "services": ["light.turn_on"],
     "notify": true, "network": false}
@@ -44,7 +57,7 @@ PAGE RULES
 - Respect the theme: the root element gets data-theme="light|dark", and the CSS
   variables --primary-color, --primary-text-color, --card-background-color,
   --primary-background-color, --secondary-text-color, --divider-color are set.
-- Do not use localStorage for anything that matters; use ha.kv.
+- localStorage, sessionStorage, indexedDB and cookies throw in the sandbox; use ha.kv.
 - Wait for `await ha.ready` before calling other ha.* functions.
 
 window.ha API (all methods return promises unless noted)
@@ -119,7 +132,7 @@ class GuideTool(_Tool):
 
 class ListTool(_Tool):
     name = "artifact_list"
-    description = "List published artifacts (id, title, version, requested and granted capabilities)."
+    description = "List published artifacts (id, title, version, size in bytes, requested and granted capabilities)."
     parameters = vol.Schema({})
 
     @_guard
@@ -130,14 +143,19 @@ class ListTool(_Tool):
 class ReadTool(_Tool):
     name = "artifact_read"
     description = (
-        "Read an artifact's full html and version. Always do this before publishing a "
-        "change: the user may have edited the page by hand."
+        "Read an artifact's html and version. Always do this before changing a page: the "
+        "user may have edited it by hand. With metadata_only=true you get only the version, "
+        "size, title and capabilities (no html), which is enough to pass as base_version."
     )
-    parameters = vol.Schema({vol.Required("artifact_id"): str})
+    parameters = vol.Schema({vol.Required("artifact_id"): str, vol.Optional("metadata_only"): bool})
 
     @_guard
     async def async_call(self, hass, tool_input, llm_context) -> JsonObjectType:
-        return _rt(hass).artifacts.get(tool_input.tool_args["artifact_id"])
+        args = tool_input.tool_args
+        artifact = _rt(hass).artifacts.get(args["artifact_id"])
+        if args.get("metadata_only"):
+            artifact.pop("html", None)
+        return artifact
 
 
 class PublishTool(_Tool):
@@ -175,7 +193,122 @@ class PublishTool(_Tool):
             source="claude",
             updated_by="claude",
         )
-        return {k: v for k, v in result.items() if k != "html"}
+        out = {k: v for k, v in result.items() if k != "html"}
+        out["lint"] = lint_html(args["html"], out.get("caps_requested"))
+        out["next"] = "Call artifact_check to see how it renders in a real browser."
+        return out
+
+
+class PatchTool(_Tool):
+    name = "artifact_patch"
+    description = (
+        "Change an existing artifact with find/replace edits instead of resending the whole page. "
+        "edits = [{old_str, new_str}] applied in order; each old_str must appear EXACTLY once in "
+        "the page (add surrounding text to make it unique); all edits apply or none do. "
+        "base_version is required: the version you read (artifact_read, metadata_only is fine). "
+        "A stale version returns a 'conflict' with the current html. Returns the new version, "
+        "lint warnings and no html."
+    )
+    parameters = vol.Schema(
+        {
+            vol.Required("artifact_id"): str,
+            vol.Required("base_version"): int,
+            vol.Required("edits"): [
+                vol.Schema({vol.Required("old_str"): str, vol.Required("new_str"): str})
+            ],
+            vol.Optional("title"): str,
+            vol.Optional("description"): str,
+            vol.Optional("capabilities"): dict,
+        }
+    )
+
+    @_guard
+    async def async_call(self, hass, tool_input, llm_context) -> JsonObjectType:
+        args = tool_input.tool_args
+        store = _rt(hass).artifacts
+        result = store.patch(
+            args["artifact_id"],
+            args["edits"],
+            base_version=args["base_version"],
+            title=args.get("title"),
+            description=args.get("description"),
+            caps_requested=args.get("capabilities"),
+            source="claude",
+            updated_by="claude",
+        )
+        out = {k: v for k, v in result.items() if k != "html"}
+        out["lint"] = lint_html(result["html"], out.get("caps_requested"))
+        out["next"] = "Call artifact_check to see how it renders in a real browser."
+        return out
+
+
+class CheckTool(_Tool):
+    name = "artifact_check"
+    description = (
+        "Render check for the CURRENT version of an artifact. Returns static lint plus what a "
+        "real browser saw when it ran the page in a hidden, side-effect-free frame: JavaScript "
+        "errors, unhandled promise rejections, console.error output and requests blocked by the "
+        "security policy, with line numbers in your html. Waits up to wait_seconds (default 20) "
+        "for a browser to report. status: ok | warnings | errors | pending. 'pending' means no "
+        "browser has Home Assistant open: ask the user to open it (the check then runs on its own) "
+        "and call again. Page logic that depends on live data is stubbed, so data-dependent "
+        "behavior still needs a human look."
+    )
+    parameters = vol.Schema({vol.Required("artifact_id"): str, vol.Optional("wait_seconds"): vol.Coerce(float)})
+
+    @_guard
+    async def async_call(self, hass, tool_input, llm_context) -> JsonObjectType:
+        args = tool_input.tool_args
+        rt = _rt(hass)
+        artifact_id = args["artifact_id"]
+        artifact = rt.artifacts.get(artifact_id)
+        version = artifact["version"]
+        wait = min(max(float(args.get("wait_seconds", 20)), 0.0), 60.0)
+
+        def settled() -> bool:
+            report = rt.reports.summary(artifact_id, version)
+            return bool(report and report["settled"])
+
+        if not settled() and wait:
+            done = asyncio.Event()
+
+            def on_report(event: dict) -> None:
+                if event.get("artifact_id") == artifact_id and settled():
+                    done.set()
+
+            remove = rt.reports.add_listener(on_report)
+            try:
+                await asyncio.wait_for(done.wait(), wait)
+            except asyncio.TimeoutError:
+                pass
+            finally:
+                remove()
+
+        report = rt.reports.summary(artifact_id, version)
+        errors = report["errors"] if report else []
+        if any(e["level"] in ("error", "console") for e in errors):
+            status = "errors"
+        elif errors:
+            status = "warnings"
+        elif report and report["settled"]:
+            status = "ok"
+        else:
+            status = "pending"
+        render: dict = {"status": status, "errors": errors, "renders": report["renders"] if report else 0}
+        if report:
+            render["reported_by"] = report["sources"]
+        if status == "pending":
+            render["hint"] = (
+                "No browser reported on this version yet. Home Assistant must be open in a browser "
+                "or the companion app (any page) for the background check to run; opening the "
+                "Artifacts panel also works."
+            )
+        return {
+            "artifact_id": artifact_id,
+            "version": version,
+            "lint": lint_html(artifact["html"], artifact.get("caps_requested")),
+            "render": render,
+        }
 
 
 class KvGetTool(_Tool):
@@ -272,7 +405,7 @@ class ArtifactsAPI(llm.API):
 
     async def async_get_api_instance(self, llm_context: llm.LLMContext) -> llm.APIInstance:
         tools: list[llm.Tool] = [
-            GuideTool(), ListTool(), ReadTool(), PublishTool(), KvGetTool(), KvSetTool(),
+            GuideTool(), ListTool(), ReadTool(), PublishTool(), PatchTool(), CheckTool(), KvGetTool(), KvSetTool(),
             TimerListTool(), TimerCreateTool(), TimerControlTool(),
         ]
         return llm.APIInstance(api=self, api_prompt=SHORT_PROMPT, llm_context=llm_context, tools=tools)

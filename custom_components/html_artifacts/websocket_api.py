@@ -197,6 +197,35 @@ def ws_timers_control(rt, connection, msg):
     return {"timer": timer}
 
 
+# -- render reports ----------------------------------------------------------------
+
+@api(
+    "report",
+    {
+        **AID,
+        vol.Required("version"): int,
+        vol.Required("source"): vol.In(["dry-run", "viewer"]),
+        vol.Optional("settled", default=False): bool,
+        vol.Optional("errors", default=[]): [dict],
+    },
+)
+def ws_report(rt, connection, msg):
+    """A browser tells us what happened when it ran an artifact (used by artifact_check)."""
+    current = rt.artifacts.version_of(msg["artifact_id"])
+    if current is None:
+        raise ArtifactError("not_found", f"artifact '{msg['artifact_id']}' does not exist")
+    if msg["version"] != current:
+        return {"stale": True, "version": current}  # a newer version was published meanwhile
+    rt.reports.add(
+        msg["artifact_id"],
+        current,
+        source=msg["source"],
+        settled=msg["settled"],
+        errors=msg["errors"][:20],
+    )
+    return {"stale": False}
+
+
 # -- notifications -----------------------------------------------------------------
 
 @api(
@@ -241,6 +270,6 @@ def async_register_websocket(hass: HomeAssistant) -> None:
         ws_list, ws_get, ws_save, ws_delete, ws_history, ws_revert, ws_set_grants,
         ws_kv_get, ws_kv_set, ws_kv_delete, ws_kv_list,
         ws_timers_list, ws_timers_create, ws_timers_control,
-        ws_notify, ws_subscribe,
+        ws_report, ws_notify, ws_subscribe,
     ):
         websocket_api.async_register_command(hass, handler)
