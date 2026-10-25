@@ -94,15 +94,25 @@ window.ha API (all methods return promises unless noted)
       (view.current.waiting) until ha.timers.answer(id, stepIndex, "yes" | seconds). The phone
       shows the question with Done / +1 min / +2 min; +N pushes the lane back and asks again.
   Manual advance ("cook until I say"): create({advance:"manual", steps:[...]}) or per step
-      {advance:"manual"|"auto", remindEvery?: seconds}. When a manual step's time is up the timer
-      does NOT move on: it stays on that step and counts overtime (current.remaining goes
-      negative, view.overtime > 0; show "+1:23 over"). Next (skip) ends it and every later step
-      shifts to when Next was pressed (pressing early pulls them sooner); extend() in overtime
-      gives the step more time first. An explicit advance:"auto" step after a manual one is a
-      reminder: it fires on time and never ends the manual step. Only the step's own lane holds.
+      {advance:"manual"|"auto", remindEvery?: seconds}.
+        manual: when its time is up the timer does NOT move on: it stays on that step and counts
+                overtime (current.remaining goes negative, view.overtime > 0: show "+1:23 over").
+                Next (skip) ends it and every later step shifts to when Next was pressed
+                (early Next pulls them sooner); extend() in overtime gives it more time first.
+        auto:   becomes current and moves on by itself when the next step is due (the default).
+        reminder: {reminder:true} (or kind:"reminder"): alerts on time, NEVER becomes current,
+                never ends the current step; Next skips past it. anchor:"step" (default) = offset
+                from the start of the step it sits under: moves with overtime/early Next, and is
+                marked skipped (not fired) if Next ends that step first. anchor:"timer" = fixed
+                offset from timer start, unaffected by overtime. A reminder can't have advance,
+                gate, duration, endLabel or after.
+      view.reminders = [{index, label, state: pending|fired|skipped, due (seconds, null once
+      done or before its step starts), armed, firedAt}] - show "Rice check - 2 min ago" chips.
       timer.step_log = [{index, track, label, planned, actual}] for every Next. reset() and
-      start() restore the schedule as created (extends and overtime shifts are undone).
-      Bus event html_artifacts_timer_overtime {step, seconds_over, reminder}.
+      start() restore the schedule as created. Only the step's own lane holds.
+      Bus: html_artifacts_timer_overtime {step, seconds_over, reminder}; reminders fire
+      html_artifacts_timer_step with reminder:true. The phone's ongoing notification keeps the
+      current manual step; a reminder gets its own alert.
   ha.timers.fromDurations([{label, seconds, detail?, track?}])  (sync) -> {steps, duration}
       (emits `duration` on each step, so the countdown shows time left in each step)
   ha.timers.list(), start(id), pause(id[, {track}]), resume(id[, {track}]), reset(id),
@@ -458,9 +468,10 @@ class TimerCreateTool(_Tool):
         "fires when those lanes are finished. A step duration makes it an activity "
         "('Simmer, 9:40 left'; endLabel announces its end). gate = {question, yes?, more?: "
         "[60,120], autoYesAfter?} pauses that lane until the phone/page answers (cook until "
-        "done). advance='manual' (timer default, or per step; explicit 'auto' steps then act as "
-        "reminders) makes a step WAIT for Next when its time is up: it counts overtime (negative "
+        "done). advance='manual' (timer default, or per step) makes a step WAIT for Next when its time is up: it counts overtime (negative "
         "remaining) and later steps shift to when Next is pressed; remind_every re-alerts while over. "
+        "Steps with reminder:true (anchor 'step' or 'timer') only alert on time: they never become "
+        "current and Next skips past them. "
         "Phone notifications need the artifact's 'notify' capability to be approved."
     )
     parameters = vol.Schema(

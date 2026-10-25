@@ -6,7 +6,7 @@ from tests.test_core import make_engine, fired, core
 SIMMER = [
     {"at": 0, "label": "Start", "advance": "auto"},
     {"at": 100, "label": "Simmer"},
-    {"at": 200, "label": "Rice check", "advance": "auto"},
+    {"at": 200, "label": "Rice check", "reminder": True, "anchor": "timer"},
     {"at": 300, "label": "Check the fish"},
     {"at": 400, "label": "Serve"},
 ]
@@ -32,7 +32,7 @@ class ManualAdvanceTest(unittest.TestCase):
         engine, sched, events, tid = make()
         sched.advance(100 + 1)  # Simmer starts
         sched.advance(0)
-        # Simmer is manual; the next step (the reminder) is auto, the boundary is "Check the fish" at 300
+        # Simmer is manual; the reminder never ends it, the boundary is "Check the fish" at 300
         sched.advance(250)  # t = 351: Simmer ran past 300
         view = engine.get_view(tid)
         self.assertEqual(view["current_index"], 1)
@@ -40,7 +40,8 @@ class ManualAdvanceTest(unittest.TestCase):
         self.assertAlmostEqual(lane(view)["remaining"], -(351 - 300), delta=2)
         self.assertAlmostEqual(view["overtime"], 51, delta=2)
         labels = [e["step"]["label"] for e in fired(events, "step")]
-        self.assertIn("Rice check", labels)  # the reminder fired on time during the hold
+        self.assertIn("Rice check", [e["step"]["label"] for e in fired(events, "reminder")])  # fired on time during the hold
+        self.assertNotIn("Rice check", labels)
         self.assertNotIn("Check the fish", labels)
         over = fired(events, "overtime")
         self.assertEqual(len(over), 1)
@@ -95,6 +96,96 @@ class ManualAdvanceTest(unittest.TestCase):
         sched.advance(300 + 190)  # overtime onset at 300, reminders at 360, 420, 480
         over = fired(events, "overtime")
         self.assertEqual([e["reminder"] for e in over], [False, True, True, True])
+
+    def test_auto_step_between_manual_steps_becomes_current(self):
+        engine, sched, backing, events = make_engine()
+        timer = engine.create("a", "x", [
+            {"at": 0, "label": "Prep", "advance": "manual"},
+            {"at": 100, "label": "Bake", "advance": "auto"},
+            {"at": 200, "label": "Check", "advance": "manual"},
+            {"at": 300, "label": "Serve", "advance": "manual"}], start=True)
+        tid = timer["id"]
+        sched.advance(150)  # Prep ran 50 over; nothing moved on
+        self.assertEqual(engine.get_view(tid)["current_index"], 0)
+        engine.skip(tid)  # Next on Prep goes to Bake, not past it
+        view = engine.get_view(tid)
+        self.assertEqual(view["steps"][view["current_index"]]["label"], "Bake")
+        sched.advance(101)  # Bake is auto: it moves on by itself to Check
+        view = engine.get_view(tid)
+        self.assertEqual(view["steps"][view["current_index"]]["label"], "Check")
+
+    def test_timer_anchored_reminder_ignores_overtime_and_next(self):
+        engine, sched, events, tid = make()
+        sched.advance(150)
+        engine.skip(tid)  # Next early, lane clock jumps to 300
+        sched.advance(55)  # timer clock 205 -> the timer-anchored reminder (at 200) still fires
+        self.assertEqual([e["step"]["label"] for e in fired(events, "reminder")], ["Rice check"])
+
+    def test_step_anchored_reminder_moves_with_the_step_and_is_skipped_by_next(self):
+        engine, sched, backing, events = make_engine()
+        timer = engine.create("a", "x", [
+            {"at": 0, "label": "Start", "advance": "auto"},
+            {"at": 100, "label": "Simmer", "advance": "manual"},
+            {"at": 160, "label": "Spoon sauce over", "reminder": True},
+            {"at": 400, "label": "Check", "advance": "manual"},
+            {"at": 500, "label": "Serve", "advance": "manual"}], start=True)
+        tid = timer["id"]
+        rem = lambda: engine.get_view(tid)["reminders"][0]
+        self.assertEqual(rem()["state"], "pending")
+        sched.advance(100)
+        engine.skip(tid)  # Start was auto; here we are on Simmer at lane time 100
+        sched.advance(10)
+        engine.skip(tid)  # wrong: leaves Simmer 50 s before the reminder
+        self.assertEqual(rem()["state"], "skipped")
+        sched.advance(200)
+        self.assertEqual(fired(events, "reminder"), [])
+
+    def test_step_anchored_reminder_fires_relative_to_a_late_start(self):
+        engine, sched, backing, events = make_engine()
+        timer = engine.create("a", "x", [
+            {"at": 0, "label": "Heat", "advance": "manual"},
+            {"at": 100, "label": "Simmer", "advance": "manual"},
+            {"at": 160, "label": "Spoon sauce over", "reminder": True},
+            {"at": 400, "label": "Check", "advance": "manual"},
+            {"at": 500, "label": "Serve", "advance": "manual"}], start=True)
+        tid = timer["id"]
+        sched.advance(250)  # Heat ran 150 over
+        engine.skip(tid)  # Simmer starts now (T=250)
+        sched.advance(55)  # T=305: only 55 s into Simmer
+        self.assertEqual(fired(events, "reminder"), [])
+        view = engine.get_view(tid)
+        self.assertAlmostEqual(view["reminders"][0]["due"], 5, delta=2)
+        sched.advance(10)  # 65 s into Simmer -> 160 on the lane clock
+        self.assertEqual([e["step"]["label"] for e in fired(events, "reminder")], ["Spoon sauce over"])
+        r = engine.get_view(tid)["reminders"][0]
+        self.assertEqual((r["state"], r["due"]), ("fired", None))
+        self.assertIsNotNone(r["firedAt"])
+        self.assertEqual(engine.get_view(tid)["steps"][engine.get_view(tid)["current_index"]]["label"], "Simmer")
+
+    def test_reminders_never_become_current_or_the_skip_target(self):
+        engine, sched, backing, events = make_engine()
+        timer = engine.create("a", "x", [
+            {"at": 0, "label": "A", "advance": "manual"},
+            {"at": 50, "label": "Nudge", "reminder": True, "anchor": "timer"},
+            {"at": 100, "label": "B", "advance": "manual"},
+            {"at": 200, "label": "C", "advance": "manual"}], start=True)
+        tid = timer["id"]
+        sched.advance(80)
+        view = engine.get_view(tid)
+        self.assertEqual(view["steps"][view["current_index"]]["label"], "A")
+        engine.skip(tid)
+        view = engine.get_view(tid)
+        self.assertEqual(view["steps"][view["current_index"]]["label"], "B")
+        with self.assertRaises(core.ArtifactError):
+            engine.skip(tid, 1)  # the reminder's index
+
+    def test_reminder_validation(self):
+        engine, _, _, _ = make_engine()
+        for bad in ({"advance": "manual"}, {"gate": {}}, {"duration": 5}, {"anchor": "moon"}):
+            with self.assertRaises(core.ArtifactError):
+                engine.create("a", "x", [dict({"at": 1, "label": "r", "reminder": True}, **bad)], 10)
+        view = engine.create("a", "x", [{"at": 1, "label": "r", "kind": "reminder"}, {"at": 5, "label": "s"}], 10)
+        self.assertEqual(view["reminders"][0]["anchor"], "step")
 
     def test_default_timer_never_holds(self):
         engine, sched, backing, events = make_engine()

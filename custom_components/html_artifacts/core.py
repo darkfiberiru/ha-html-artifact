@@ -750,6 +750,7 @@ class TimerEngine(_Listeners):
         timer.setdefault("step_log", [])
         for ts in timer["tstate"].values():
             ts.setdefault("ot", None)
+            ts.setdefault("rem", {})
 
     @staticmethod
     def _is_manual(timer: dict, step: dict) -> bool:
@@ -759,10 +760,35 @@ class TimerEngine(_Listeners):
     def _remind_every(timer: dict, step: dict) -> float | None:
         return step.get("remindEvery") or timer.get("remind_every") or None
 
-    def _is_reminder(self, timer: dict, cur_step: dict, step: dict) -> bool:
-        """An explicit advance:"auto" step after a manual one is a reminder: it fires on time
-        but does not end the manual step (only Next does)."""
-        return step.get("advance") == "auto" and not step.get("gate") and self._is_manual(timer, cur_step)
+    def _armed(self, timer: dict, tid: str, ts: dict, index: int) -> bool:
+        """A step-anchored reminder only runs once the step it sits under has started."""
+        steps = timer["steps"]
+        reminder = steps[index]
+        parent = None
+        for number, step in enumerate(steps):
+            if step["track"] == tid and not step.get("reminder") and step["at"] <= reminder["at"] + EPS:
+                parent = number
+        if parent is None:
+            return True
+        events = self._events(timer, tid)
+        return any(e[3] == parent and e[2] != "end" for e in events[: ts["ev"]])
+
+    def _pending_reminders(self, timer: dict, tid: str, ts: dict) -> list[tuple[float, int]]:
+        """(timer-clock due time, step index) of reminders in a lane that have not fired yet.
+
+        anchor "step" reminders run on the lane's own clock (so they move with overtime and an
+        early Next, and freeze while the lane is held); anchor "timer" ones are fixed offsets
+        from the start of the timer."""
+        out = []
+        for index, step in enumerate(timer["steps"]):
+            if not step.get("reminder") or step["track"] != tid or str(index) in ts["rem"]:
+                continue
+            if step.get("anchor") == "timer":
+                out.append((step["at"], index))
+            elif ts["hold_since"] is None and self._armed(timer, tid, ts, index):
+                out.append((step["at"] + ts["held"], index))
+        out.sort()
+        return out
 
     def _cur_step(self, timer: dict, events: list, upto: int) -> int | None:
         """Index of the step the lane is on after the first ``upto`` events."""
@@ -770,14 +796,12 @@ class TimerEngine(_Listeners):
         for time_, _order, kind, index in events[:upto]:
             if kind == "end":
                 continue
-            if cur is not None and kind == "start" and self._is_reminder(timer, steps[cur], steps[index]):
-                continue
             cur = index
         return cur
 
     def _manual_hold(self, timer: dict, tid: str, events: list, ev: int) -> dict | None:
         """Describe a manual step waiting for "Next": its index, when its time is up, and whether
-        the next pending event (an end alert or a reminder) may still fire on time."""
+        the next pending event (an end-of-activity alert) may still fire on time."""
         if tid == JOIN_TRACK or ev >= len(events):
             return None
         cur = self._cur_step(timer, events, ev)
@@ -785,12 +809,8 @@ class TimerEngine(_Listeners):
         if cur is None or steps[cur].get("gate") or not self._is_manual(timer, steps[cur]):
             return None
         j = ev
-        while j < len(events):
-            _t, _o, kind, index = events[j]
-            if kind == "end" or (kind == "start" and self._is_reminder(timer, steps[cur], steps[index])):
-                j += 1
-                continue
-            break
+        while j < len(events) and events[j][2] == "end":
+            j += 1  # an end-of-activity alert still fires on time
         if j >= len(events):
             return None
         step = steps[cur]
@@ -800,7 +820,7 @@ class TimerEngine(_Listeners):
     @staticmethod
     def _new_tstate(ev: int = 0) -> dict:
         return {"ev": ev, "held": 0.0, "hold_since": None, "waiting": None, "manual": False,
-                "auto_at": None, "offset": 0.0, "regates": [], "ot": None}
+                "auto_at": None, "offset": 0.0, "regates": [], "ot": None, "rem": {}}
 
     # -- low-level model -----------------------------------------------------
 
@@ -809,8 +829,8 @@ class TimerEngine(_Listeners):
         """Sorted (time, order, kind, step index) tuples of one track."""
         events: list[tuple] = []
         for index, step in enumerate(timer["steps"]):
-            if step["track"] != tid:
-                continue
+            if step["track"] != tid or step.get("reminder"):
+                continue  # reminders are not part of the sequence: they never become current
             events.append((step["at"], 0, "start", index))
             if step.get("duration") and step.get("endLabel") and not step.get("gate"):
                 events.append((step["at"] + step["duration"], 1, "end", index))
@@ -823,7 +843,7 @@ class TimerEngine(_Listeners):
     def _track_end(timer: dict, tid: str) -> float:
         end = 0.0
         for step in timer["steps"]:
-            if step["track"] == tid:
+            if step["track"] == tid and not step.get("reminder"):
                 end = max(end, step["at"] + (0 if step.get("gate") else step.get("duration") or 0))
         for regate in timer["tstate"][tid]["regates"]:
             end = max(end, regate["at"])
@@ -985,6 +1005,24 @@ class TimerEngine(_Listeners):
         else:
             current, nxt, next_in = max((v["current_index"] for v in views.values()), default=-1), None, remaining
         real = [views[t["id"]] for t in timer["tracks"] if t["id"] in views]
+        multi = bool(timer.get("multi"))
+        reminders = []
+        for index, step in enumerate(steps):
+            if not step.get("reminder"):
+                continue
+            ts = timer["tstate"].get(step["track"])
+            record = ts["rem"].get(str(index)) if ts else None
+            state = record["state"] if record else ("skipped" if timer["state"] == "finished" else "pending")
+            due = None
+            armed = state == "pending" and (step.get("anchor") == "timer" or self._armed(timer, step["track"], ts, index))
+            if armed:
+                base = big_t if step.get("anchor") == "timer" else views[step["track"]]["elapsed"]
+                due = round(max(0.0, step["at"] - base), 3)
+            reminders.append({
+                "index": index, "label": step["label"], "detail": step.get("detail", ""),
+                "track": step["track"] if multi else None, "anchor": step.get("anchor", "step"),
+                "state": state, "armed": armed, "due": due, "firedAt": record.get("at") if record else None,
+            })
         return {
             "id": timer["id"],
             "artifact_id": timer["artifact_id"],
@@ -1004,6 +1042,7 @@ class TimerEngine(_Listeners):
             "server_now": now,
             "multi": bool(timer.get("multi")),
             "tracks": real,
+            "reminders": reminders,
             "join": views.get(JOIN_TRACK),
             "waiting": waiting,
             "history": copy.deepcopy(timer.get("history") or []),
@@ -1054,7 +1093,12 @@ class TimerEngine(_Listeners):
         """Timer-clock moment of the next thing that needs attention (None = nothing scheduled)."""
         best: float | None = None
         pending = False
+        soonest_reminder: float | None = None
         for tid, ts in timer["tstate"].items():
+            if tid != JOIN_TRACK:
+                due = self._pending_reminders(timer, tid, ts)
+                if due:
+                    soonest_reminder = due[0][0] if soonest_reminder is None else min(soonest_reminder, due[0][0])
             if ts["waiting"] is not None:
                 pending = True
                 if ts.get("auto_at") is not None:
@@ -1082,9 +1126,13 @@ class TimerEngine(_Listeners):
                 when = max(when, ready)
             best = when if best is None else min(best, when)
         if pending:
-            return best
-        ends = [timer["duration"] + ts["held"] for ts in timer["tstate"].values() if ts["hold_since"] is None]
-        return min(ends) if ends else None
+            base = best
+        else:
+            ends = [timer["duration"] + ts["held"] for ts in timer["tstate"].values() if ts["hold_since"] is None]
+            base = min(ends) if ends else None
+        if soonest_reminder is not None:
+            return soonest_reminder if base is None else min(base, soonest_reminder)
+        return base
 
     def _arm(self, timer: dict) -> None:
         self._disarm(timer["id"])
@@ -1111,6 +1159,11 @@ class TimerEngine(_Listeners):
         while True:
             best = None
             for tid, ts in timer["tstate"].items():
+                due_reminders = self._pending_reminders(timer, tid, ts) if tid != JOIN_TRACK else []
+                if due_reminders and due_reminders[0][0] <= big_t + EPS:
+                    cand = (due_reminders[0][0], tid, "reminder", due_reminders[0][1])
+                    if best is None or cand[0] < best[0]:
+                        best = cand
                 if ts["hold_since"] is not None:
                     if ts["waiting"] is not None and ts.get("auto_at") is not None and ts["auto_at"] <= big_t + EPS:
                         cand = (ts["auto_at"], tid, "auto", None)
@@ -1158,6 +1211,10 @@ class TimerEngine(_Listeners):
             if kind == "auto":
                 self._release(ts, when)
                 self._log(timer, "answer", self._clock(), track=tid, answer="auto", source="auto")
+                continue
+            if kind == "reminder":
+                ts["rem"][str(index)] = {"state": "fired", "at": self._clock() - max(0.0, big_t - when)}
+                fired.append({"kind": "reminder", "phase": "start", "index": index, "track": tid, "t": when})
                 continue
             if kind in ("overtime", "remind"):
                 every = self._remind_every(timer, steps[index])
@@ -1373,6 +1430,16 @@ class TimerEngine(_Listeners):
             else:
                 tid = str(raw.get("track") or DEFAULT_TRACK)
                 step["track"] = tid
+            if raw.get("reminder") or raw.get("kind") == "reminder":
+                clash = [k for k in ("advance", "gate", "duration", "endLabel", "after", "remindEvery") if raw.get(k) is not None]
+                if clash or join:
+                    raise ArtifactError("invalid", f"a reminder only alerts on time; it can't have {', '.join(clash) or 'a join'}")
+                anchor = raw.get("anchor") or "step"
+                if anchor not in ("step", "timer"):
+                    raise ArtifactError("invalid", 'anchor must be "step" or "timer"')
+                step.update(reminder=True, anchor=anchor)
+                normalized.append(step)
+                continue
             if raw.get("advance") is not None:
                 step["advance"] = _advance_mode(raw["advance"])
             if raw.get("remindEvery") is not None:
@@ -1390,12 +1457,12 @@ class TimerEngine(_Listeners):
                 if raw.get("endLabel"):
                     step["endLabel"] = _clean_str(raw["endLabel"], 120, "endLabel")
             normalized.append(step)
-        plan_end = max((s["at"] + (s.get("duration") or 0) for s in normalized if "_auto_at" not in s), default=0.0)
+        plan_end = max((s["at"] + (s.get("duration") or 0) for s in normalized if "_auto_at" not in s and not s.get("reminder")), default=0.0)
         for step in normalized:
             if step.pop("_auto_at", False):
                 step["at"] = step["plan_at"] = plan_end  # a join with no time sorts after the work it waits for
         normalized.sort(key=lambda s: s["at"])
-        last = max((s["at"] + (s.get("duration") or 0) for s in normalized), default=0.0)
+        last = max((s["at"] + (s.get("duration") or 0) for s in normalized if not s.get("reminder")), default=0.0)
         try:
             total = float(duration) if duration is not None else last
         except (TypeError, ValueError) as err:
@@ -1552,6 +1619,8 @@ class TimerEngine(_Listeners):
         if to_index is not None:
             if not isinstance(to_index, int) or isinstance(to_index, bool) or not 0 <= to_index < len(steps):
                 raise ArtifactError("invalid", "to_index is out of range")
+            if steps[to_index].get("reminder"):
+                raise ArtifactError("invalid", "a reminder is not a step: Next skips past it")
             tid = steps[to_index]["track"]
             events = self._events(timer, tid)
             position = next((i for i, e in enumerate(events) if e[3] == to_index and e[2] != "end"), None)
@@ -1602,6 +1671,10 @@ class TimerEngine(_Listeners):
             )
             del timer["step_log"][:-MAX_TIMER_LOG]
         ts["ot"] = None
+        for number, other in enumerate(steps):  # reminders of the step being left will not fire
+            if (other.get("reminder") and other["track"] == tid and other.get("anchor") != "timer"
+                    and str(number) not in ts["rem"] and other["at"] < time_ - EPS):
+                ts["rem"][str(number)] = {"state": "skipped", "at": None}
         if ts["hold_since"] is not None:
             if ts["waiting"] is not None:
                 self._release(ts, big_t)
@@ -1632,7 +1705,7 @@ class TimerEngine(_Listeners):
                 ts["ot"] = None
             return
         for step in timer["steps"]:
-            if step["track"] != tid:
+            if step["track"] != tid or (step.get("reminder") and step.get("anchor") == "timer"):
                 continue
             if step["at"] > el + EPS:
                 step["at"] = max(el + 1.0, step["at"] + seconds)

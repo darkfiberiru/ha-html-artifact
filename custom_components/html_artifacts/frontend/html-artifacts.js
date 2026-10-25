@@ -181,7 +181,7 @@
       };
       const lanes = (t.tracks || []).map(laneView);
       const join = t.join ? laneView(t.join) : null;
-      const hasExtras = !!(t.multi || t.advance === "manual" || steps.some((s) => s.gate || s.duration || s.after || s.advance));
+      const hasExtras = !!(t.multi || t.advance === "manual" || steps.some((s) => s.gate || s.duration || s.after || s.advance || s.reminder));
       let top;
       if (!hasExtras) {
         // A plain flat timer: derive everything from the clock, as it always has.
@@ -219,7 +219,11 @@
           nextIn: Math.max(0, t.next_in - adj),
         };
       }
-      const out = Object.assign({}, t, top, { tracks: lanes, join, waiting: t.waiting || [] });
+      // Reminders never become current; pages can show them as chips ("Rice check · 2 min ago").
+      const reminders = (t.reminders || []).map((r) =>
+        Object.assign({}, r, { due: r.due == null ? null : Math.max(0, r.due - (running ? dt : 0)) })
+      );
+      const out = Object.assign({}, t, top, { tracks: lanes, join, waiting: t.waiting || [], reminders });
       Object.defineProperty(out, "_raw", { value: t, enumerable: false });
       return out;
     }
@@ -1537,7 +1541,7 @@
         return {
           id: "dry-run", artifact_id: art.id, label: (p && p.label) || "", state: "idle",
           duration: (p && p.duration) || 0, steps: (p && p.steps) || [], elapsed_now: 0, notify_targets: [],
-          remaining: 0, current_index: -1, next_index: null, next_in: 0, multi: false, tracks: [], join: null, waiting: [], history: [], overtime: 0, step_log: [],
+          remaining: 0, current_index: -1, next_index: null, next_in: 0, multi: false, tracks: [], join: null, waiting: [], reminders: [], history: [], overtime: 0, step_log: [],
         };
       default:
         return null;

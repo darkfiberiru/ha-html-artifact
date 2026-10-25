@@ -120,6 +120,7 @@ class TimerNotifier:
                 "index": event.get("index"),
                 "track": event.get("track"),
                 "phase": event.get("phase", "start"),
+                "reminder": kind == "reminder",
                 "missed": event.get("missed", 0),
             }
             if kind == "overtime":
@@ -136,7 +137,8 @@ class TimerNotifier:
                     finished=timer.get("finished_wall"),
                 )
             self._hass.bus.async_fire(
-                {"step": EVENT_STEP, "gate": EVENT_GATE, "overtime": EVENT_OVERTIME, "finished": EVENT_FINISHED}[kind], data
+                {"step": EVENT_STEP, "reminder": EVENT_STEP, "gate": EVENT_GATE, "overtime": EVENT_OVERTIME,
+                 "finished": EVENT_FINISHED}[kind], data
             )
             if self._allowed(timer):
                 self._hass.async_create_task(self._alert(event))
@@ -169,6 +171,19 @@ class TimerNotifier:
             return
         if event["kind"] == "overtime":
             await self._overtime_alert(event, prefix)
+            return
+        if event["kind"] == "reminder":
+            # A nudge on its own tag: the ongoing notification keeps showing the current step.
+            message = prefix + step["label"] + (f" - {step['detail']}" if step.get("detail") else "")
+            data = {
+                "tag": f"{self._tag(timer)}_reminder_{event['index']}",
+                "channel": "html_artifacts_alerts",
+                "importance": "high",
+                "priority": "high",
+                "ttl": 0,
+                "push": {"interruption-level": "time-sensitive"},
+            }
+            await self._send(self._targets(timer), timer["label"], message, data, data["tag"], timer["artifact_id"])
             return
         if event["kind"] == "finished":
             message = (step or {}).get("label") or "Done"

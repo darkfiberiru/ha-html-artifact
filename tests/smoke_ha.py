@@ -240,6 +240,21 @@ async def main():
     timers.control(mid, "delete")
     ok("manual advance: time's-up alert with Next / +1 min, counting-up notification, tap opens the artifact")
 
+    # --- reminders: own alert, ongoing notification keeps the current step ------------------------
+    sent.clear()
+    r = await ws("timers/create", artifact_id="pesto", label="Remind test", advance="manual", start=True,
+                 steps=[{"at": 0, "label": "Simmer"}, {"at": 0.5, "label": "Rice check", "reminder": True, "anchor": "timer"},
+                        {"at": 2.0, "label": "Serve"}])
+    assert r["success"], r
+    rid = r["result"]["timer"]["id"]
+    await asyncio.sleep(0.9)
+    rem = [x for x in sent if x["data"].get("tag", "").endswith("_reminder_1")]
+    assert rem and rem[0]["message"] == "Rice check", [x["message"] for x in sent]
+    view = timers.get_view(rid)
+    assert view["steps"][view["current_index"]]["label"] == "Simmer" and view["reminders"][0]["state"] == "fired", view["reminders"]
+    timers.control(rid, "delete")
+    ok("reminder: its own alert, the current step is unchanged")
+
     # timers cannot be driven through another artifact
     await ws("save", artifact_id="other", html="x")
     r = await ws("timers/control", artifact_id="other", timer_id=tid, action="reset")

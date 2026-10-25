@@ -176,7 +176,12 @@ need to agree. The full reference Claude reads is `AUTHORING_GUIDE` in `llm_api.
   up the timer stays on it and counts **overtime**: `view.current.remaining` goes negative and `view.overtime` is
   positive (render `+1:23 over`). **Next** ends the step and shifts every later step to when you pressed it (pressing
   early pulls them sooner); `+1 min` during overtime gives the step more time. `remindEvery` re-alerts while over.
-  An explicit `advance: "auto"` step after a manual one is a reminder: it fires on time and never ends the manual step.
+  Three explicit kinds: `manual` (holds and counts overtime until Next), `auto` (the default: becomes current and moves
+  on by itself), and `reminder: true` (alerts on time, never becomes current, never ends the current step; Next skips past
+  it). A reminder's `anchor` is `"step"` (default: offset from the step it sits under, so it moves with overtime and an
+  early Next, and is marked `skipped` if Next ends that step first) or `"timer"` (fixed offset from the start, unaffected
+  by overtime). `view.reminders` lists `{index, label, state: pending|fired|skipped, due, firedAt}` for "Rice check · 2 min
+  ago" chips; a reminder gets its own phone alert while the ongoing notification keeps the current step.
   Only that step's lane waits. `timer.step_log` records planned vs actual per Next; `reset`/`start` restore the original
   schedule; `html_artifacts_timer_overtime` fires for automations.
 - **History.** `timer.history` records every start, pause, resume, extend, skip and answer (time, lane, step, source) and
