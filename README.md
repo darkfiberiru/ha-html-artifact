@@ -12,6 +12,7 @@ panel or dashboard card, and gives it a small `window.ha` API:
 | **Server-side timers** (`ha.timers`) | Timers with named steps that keep running with the page closed, resume on any device, survive HA restarts, and push alerts + a live countdown to your phone. |
 | **Entities & services** (`ha.entities`, `ha.callService`) | Read and subscribe to HA entities, call services, scoped to what you approved. |
 | **Phone notifications** (`ha.notify`) | Notifications through your `notify.mobile_app_*` services. |
+| **Asset files** (`ha.assets`) | Images, 3D models and data files stored on the HA server next to the page (up to 64 MB per artifact), for pages bigger than the 2 MB HTML limit. |
 
 The cooking page is just one example. Anything Claude can write as one HTML file can use these:
 trackers, kitchen displays, chore boards, planners, status walls, games.
@@ -53,7 +54,7 @@ update, with release notes and an **Install** button. After installing, restart 
 **MCP (recommended).** Add HA's *Model Context Protocol Server* integration and select the
 **HTML Artifacts** API, then point Claude Desktop / Claude Code at it. Claude gets
 `artifact_authoring_guide`, `artifact_list`, `artifact_read`, `artifact_publish`, `artifact_patch`, `artifact_check`,
-`artifact_kv_get/set` (`prefix` filters the key list) and `artifact_timer_list/create/control` (`create` takes `tracks`, step `gate`/`duration`/`after`; `control` takes `track` and the `answer` action). `artifact_read` accepts `include_html=false`; `artifact_patch` accepts `old`/`new` as well as `old_str`/`new_str`. If your MCP server setup only allows one API at a
+`artifact_kv_get/set` (`prefix` filters the key list), `artifact_timer_list/create/control` (`create` takes `tracks`, step `gate`/`duration`/`after`; `control` takes `track` and the `answer` action) and `artifact_assets_list/import/upload_url`, `artifact_asset_put/delete`. `artifact_read` accepts `include_html=false`; `artifact_patch` accepts `old`/`new` as well as `old_str`/`new_str`. If your MCP server setup only allows one API at a
 time, use REST below.
 
 **REST.** `PUT /api/html_artifacts/<id>` with a long-lived token (see `tools/publish.py`):
@@ -82,6 +83,36 @@ tools/publish.py house-board  examples/house-board.html --caps '{"entities":["se
 the `base_version` that was read. If you edited the page in the meantime, the publish is refused
 with a `conflict` that carries your current HTML, so Claude merges instead of overwriting. Every
 version is kept (last 20) and any can be restored from the panel.
+
+## Asset files
+
+A page is one HTML file of at most 2 MB, stored with its last 20 versions. Anything bulky (drawings,
+photos, 3D models, data) goes in the artifact's **asset files** instead:
+
+- Stored on disk in `<config>/html_artifacts/artifacts/<id>/`, not in `.storage` and not versioned.
+  Deleted with the artifact. Never served from `/local`: the page gets them through the panel's
+  authenticated bridge, so they work with the default no-network policy and need no permission.
+- Limits: 8 MB per file, 64 MB and 1000 files per artifact. Paths like `img/plan.webp`, `models/base.stl`;
+  allowed types are images, audio/video, json/txt/csv/md/css/js, fonts, pdf, stl/obj/glb/gltf/3mf/bin.
+- In the page: `await ha.assets.get("models/base.stl")` (ArrayBuffer; or `"text"`, `"json"`, `"blob"`),
+  `img.src = await ha.assets.url("img/plan.webp")`, `await ha.assets.list()`.
+
+Getting files in, cheapest first (MCP):
+
+0. **Signed upload URL** (like Box's MCP pattern): `artifact_assets_upload_url` returns a single-use URL
+   (15 min by default, at most 60) bound to one file path or to a zip import. Wherever the file is, push it
+   with `curl -sS -X PUT --data-binary @file "<url>"`: no token, and the bytes never pass through the
+   conversation. `sha256` is checked on arrival if given.
+1. `artifact_assets_import` with `source: "inbox:<name>.zip"`: unzips a zip already in
+   `<config>/html_artifacts/inbox/` (for example copied there over the Samba share). The data never passes
+   through the conversation; the zip is removed after a successful import.
+2. `artifact_assets_import` with an `http(s)` URL of a zip that Home Assistant can reach (a LAN address is fine).
+3. `artifact_asset_put` with base64, in chunks with `offset` and `final`, optionally checked with `sha256`.
+   Every byte goes through Claude's context, so it suits small files.
+
+Every zip member is checked before anything is written (plain relative paths, allowed types, no links,
+size/count limits, no zip bombs). Over REST: `PUT /api/html_artifacts/<id>/assets/<path>` with the raw file,
+or `tools/publish.py <id> page.html --assets <folder>`.
 
 ## `window.ha`
 
@@ -119,6 +150,10 @@ await ha.timers.answer(id, stepIndex, "yes");      // or 60 = cook 60 s more
 ha.entities.subscribe(["sensor.oven_*"], (state, entityId) => ...);
 await ha.callService("light", "toggle", {}, {entity_id: "light.kitchen"});
 await ha.notify("Oven is hot", "Kitchen");
+
+// the artifact's own asset files (no permission needed)
+const stl = await ha.assets.get("models/base.stl");          // ArrayBuffer
+document.querySelector("img").src = await ha.assets.url("img/plan.webp");
 ```
 
 The root element gets `data-theme="light|dark"` and the HA CSS variables, so pages can match the

@@ -96,6 +96,7 @@ const ok = (name, fn) => Promise.resolve().then(fn).then(() => { passed++; conso
     parent, window: bwin, performance: { now: () => now }, console: fakeConsole,
     document: { documentElement: root, addEventListener: (t, fn) => (docHandlers[t] = docHandlers[t] || []).push(fn) },
     setTimeout: (fn, ms) => timeouts.push({ fn, ms }),
+    TextDecoder, Blob, URL: { createObjectURL: (b) => "blob:test/" + b.size },
   };
   vm.createContext(sandbox);
   vm.runInContext("(" + T.bridgeMain.toString() + ")()", sandbox);
@@ -251,6 +252,30 @@ const ok = (name, fn) => Promise.resolve().then(fn).then(() => { passed++; conso
     assert.strictEqual(timer.state, "idle", "a dry-run timer never starts");
     assert.strictEqual(timer.label, "Rice");
     assert.deepStrictEqual(plain(T.dryReply("timer.list", {}, art)), []);
+  });
+
+  await ok("assets: get as text/json/blob, url is cached", async () => {
+    const enc = (t) => { const u = new TextEncoder().encode(t); return u.buffer.slice(u.byteOffset, u.byteOffset + u.byteLength); };
+    const p = ha.assets.get("data/a.json", "json");
+    let msg = posted[posted.length - 1];
+    assert.deepStrictEqual([msg.method, msg.params.path], ["assets.get", "data/a.json"]);
+    deliver({ id: msg.id, result: { buffer: enc('{"n":3}'), type: "application/json" } });
+    assert.strictEqual((await p).n, 3);
+
+    const t = ha.assets.get("notes.txt", "text");
+    deliver({ id: posted[posted.length - 1].id, result: { buffer: enc("hello"), type: "text/plain" } });
+    assert.strictEqual(await t, "hello");
+
+    const u1 = ha.assets.url("img/x.png");
+    const u2 = ha.assets.url("img/x.png");
+    assert.strictEqual(u1, u2, "same promise for the same path");
+    msg = posted[posted.length - 1];
+    deliver({ id: msg.id, result: { buffer: new ArrayBuffer(7), type: "image/png" } });
+    assert.strictEqual(await u1, "blob:test/7");
+
+    const missing = ha.assets.get("nope.png");
+    deliver({ id: posted[posted.length - 1].id, error: { code: "not_found", message: "asset 'nope.png' does not exist" } });
+    await assert.rejects(missing, (e) => e.code === "not_found");
   });
 
   console.log(`\n${passed} frontend checks passed`);
