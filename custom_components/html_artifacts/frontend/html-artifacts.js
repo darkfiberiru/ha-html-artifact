@@ -584,10 +584,21 @@
 `;
 
   const PANEL_CSS = `
-    :host { display: block; height: 100%; color: var(--primary-text-color); background: var(--primary-background-color); }
+    :host { display: flex; flex-direction: column; height: 100%; min-height: 100vh; min-height: 100dvh; color: var(--primary-text-color); background: var(--primary-background-color); }
     * { box-sizing: border-box; }
-    .app { display: grid; grid-template-columns: 240px 1fr; height: 100%; min-height: 0; }
-    @media (max-width: 800px) { .app { grid-template-columns: 1fr; grid-template-rows: auto 1fr; } aside { max-height: 28vh; } }
+    [hidden] { display: none !important; }
+    .app { flex: 1; min-height: 0; display: grid; grid-template-columns: 240px minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); }
+    .app[data-mode="list"], .app[data-mode="view"] { grid-template-columns: minmax(0, 1fr); }
+    .app[data-mode="list"] .main { display: none; }
+    .app[data-mode="view"] aside { display: none; }
+    .app[data-mode="view"] .editonly, .app[data-mode="edit"] .viewonly { display: none !important; }
+    .app[data-mode="view"] #editor, .app[data-mode="view"] #perms { display: none; }
+    .app[data-mode="view"] .bar { flex-wrap: nowrap; }
+    .app[data-mode="view"] #title { flex: 1 1 0; min-width: 0; text-overflow: ellipsis; }
+    #back .full { display: inline; }
+    @media (max-width: 520px) { #back .full { display: none; } }
+    .app[data-mode="view"] #title { border-color: transparent; background: transparent; font-weight: 600; font-size: 16px; pointer-events: none; }
+    @media (max-width: 800px) { .app[data-mode="edit"] { grid-template-columns: minmax(0, 1fr); } .app[data-mode="edit"] aside { display: none; } }
     aside { border-right: 1px solid var(--divider-color); overflow: auto; background: var(--card-background-color); }
     .side-head { display: flex; align-items: center; gap: 8px; padding: 10px 12px; position: sticky; top: 0; background: var(--card-background-color); border-bottom: 1px solid var(--divider-color); }
     .side-head b { flex: 1; }
@@ -598,7 +609,7 @@
     li .t { font-weight: 600; display: flex; align-items: center; gap: 8px; }
     li .s { font-size: 12px; color: var(--secondary-text-color); }
     .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--warning-color, #e6a700); flex: none; }
-    .main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+    .main { display: flex; flex-direction: column; min-width: 0; min-height: 0; position: relative; }
     .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 10px 12px; border-bottom: 1px solid var(--divider-color); }
     .bar input { flex: 1 1 160px; min-width: 120px; }
     input, select, textarea, button { font: inherit; color: var(--primary-text-color); background: var(--card-background-color); border: 1px solid var(--divider-color); border-radius: 8px; padding: 7px 10px; }
@@ -610,10 +621,17 @@
     .pill.pending { color: var(--warning-color, #b07a00); }
     .pill.ok { color: var(--success-color, #2e7d32); }
     .banner { padding: 10px 14px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; background: color-mix(in srgb, var(--warning-color, #e6a700) 20%, transparent); border-bottom: 1px solid var(--divider-color); }
-    .split { flex: 1; display: grid; grid-template-columns: 1fr 1fr; min-height: 0; }
-    @media (max-width: 1100px) { .split { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; } }
+    .split { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); min-height: 0; }
+    .app[data-mode="view"] .split { grid-template-columns: minmax(0, 1fr); }
+    @media (max-width: 1100px) { .app[data-mode="edit"] .split { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) minmax(0, 1fr); } }
     #editor { border: 0; border-right: 1px solid var(--divider-color); border-radius: 0; resize: none; font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; tab-size: 2; white-space: pre; background: var(--code-editor-background-color, var(--card-background-color)); min-height: 0; }
-    .preview { min-height: 0; overflow: auto; background: var(--card-background-color); }
+    .preview { position: relative; min-height: 0; overflow: hidden; background: var(--card-background-color); }
+    .preview iframe { position: absolute !important; inset: 0; width: 100% !important; height: 100% !important; }
+    .pill { cursor: pointer; }
+    .app.immersive .main { position: fixed; inset: 0; z-index: 2147483000; background: var(--card-background-color); }
+    .app.immersive .bar, .app.immersive .banner { display: none !important; }
+    .exit { position: absolute; top: 8px; right: 8px; z-index: 5; opacity: .55; border-radius: 999px; padding: 6px 12px; }
+    .exit:hover { opacity: 1; }
     .empty { padding: 24px; color: var(--secondary-text-color); }
     dialog { border: 1px solid var(--divider-color); border-radius: 14px; background: var(--card-background-color); color: var(--primary-text-color); max-width: 520px; width: calc(100% - 32px); }
     dialog label { display: grid; gap: 4px; margin: 10px 0; font-size: 14px; }
@@ -628,25 +646,31 @@
 
   const PANEL_HTML = `
     <style>${PANEL_CSS}</style>
-    <div class="app">
+    <div class="app" data-mode="list">
       <aside>
         <div class="side-head"><button id="menu" class="icon" hidden>☰</button><b>Artifacts</b><button id="new" class="icon" title="New artifact">+</button></div>
         <ul id="list"></ul>
       </aside>
       <section class="main">
         <div class="bar">
+          <button id="menu2" class="icon" hidden title="Menu">☰</button>
+          <button id="back" class="icon viewonly" title="All artifacts">‹<span class="full"> Artifacts</span></button>
           <input id="title" placeholder="Title" disabled>
-          <span id="pill" class="pill" hidden></span>
-          <select id="hist" title="Version history" disabled></select>
+          <span id="pill" class="pill" hidden title="Review permissions"></span>
+          <select id="hist" class="editonly" title="Version history" disabled></select>
           <button id="perms" disabled>Permissions</button>
-          <button id="del" disabled>Delete</button>
-          <button id="save" class="primary" disabled>Save</button>
+          <button id="del" class="editonly" disabled>Delete</button>
+          <button id="save" class="primary editonly" disabled>Save</button>
+          <button id="edit" class="viewonly" title="Edit the page source" disabled>Edit</button>
+          <button id="done" class="editonly" title="Back to the page">Done</button>
+          <button id="full" class="viewonly" title="Full screen" disabled>⛶</button>
         </div>
         <div id="banner" class="banner" hidden></div>
         <div class="split">
           <textarea id="editor" spellcheck="false" placeholder="Pick an artifact on the left, or create one with +" disabled></textarea>
           <div id="preview" class="preview"><div class="empty">The live preview appears here.</div></div>
         </div>
+        <button id="exit" class="exit" hidden title="Exit full screen">✕</button>
       </section>
       <dialog id="dlg">
         <h3 style="margin:0 0 4px">Permissions</h3>
@@ -673,10 +697,11 @@
       this._started = false;
       this._runner = null;
       this._previewTimer = null;
+      this._mode = "list";
     }
 
     $(id) {
-      return this.shadowRoot.getElementById(id);
+      return id === "app" ? this.shadowRoot.querySelector(".app") : this.shadowRoot.getElementById(id);
     }
 
     set hass(hass) {
@@ -694,7 +719,10 @@
 
     set narrow(v) {
       this._narrow = v;
-      if (this._built) this.$("menu").hidden = !v;
+      if (this._built) {
+        this.$("menu").hidden = !v;
+        this.$("menu2").hidden = !v;
+      }
     }
 
     disconnectedCallback() {
@@ -703,6 +731,7 @@
       if (this._runner) this._runner.destroy();
       this._runner = null;
       this._started = false;
+      this._exitImmersive();
     }
 
     _ws(type, extra) {
@@ -720,9 +749,17 @@
     _build() {
       this._built = true;
       this.shadowRoot.innerHTML = PANEL_HTML;
-      this.$("menu").hidden = !this._narrow;
-      this.$("menu").onclick = () =>
-        this.dispatchEvent(new Event("hass-toggle-menu", { bubbles: true, composed: true }));
+      for (const id of ["menu", "menu2"]) {
+        this.$(id).hidden = !this._narrow;
+        this.$(id).onclick = () =>
+          this.dispatchEvent(new Event("hass-toggle-menu", { bubbles: true, composed: true }));
+      }
+      this.$("back").onclick = () => this._setMode("list");
+      this.$("edit").onclick = () => this._setMode("edit");
+      this.$("done").onclick = () => this._done();
+      this.$("full").onclick = () => this._enterImmersive();
+      this.$("exit").onclick = () => this._exitImmersive();
+      this.$("pill").onclick = () => this._cur && this._openPerms();
       this.$("new").onclick = () => this._create();
       this.$("save").onclick = () => this._save();
       this.$("del").onclick = () => this._delete();
@@ -747,7 +784,10 @@
       };
       this.$("list").onclick = (e) => {
         const li = e.target.closest("li[data-id]");
-        if (li) this._guardedOpen(li.dataset.id);
+        if (!li) return;
+        this._guardedOpen(li.dataset.id).then(() => {
+          if (this._mode === "list" && this._cur) this._setMode("view");
+        });
       };
       this.$("hist").onchange = (e) => {
         const v = Number(e.target.value);
@@ -770,7 +810,10 @@
         });
         const last = localStorage.getItem(LS_LAST);
         const first = this._list.find((a) => a.id === last) || this._list[0];
-        if (first) await this._open(first.id);
+        if (first) {
+          await this._open(first.id);
+          this._setMode("view");
+        }
       } catch (err) {
         this._toast("Could not load artifacts: " + (err.message || err.code));
       }
@@ -786,7 +829,7 @@
         .map(
           (a) => `<li data-id="${esc(a.id)}" class="${this._cur && this._cur.id === a.id ? "sel" : ""}">
             <span class="t">${pendingCaps(a) ? '<span class="dot" title="Permissions requested"></span>' : ""}${esc(a.title)}</span>
-            <span class="s">v${a.version} · ${esc(a.updated_by)}</span></li>`
+            <span class="s">${esc(a.id)} · v${a.version} · ${esc(a.updated_by)}</span></li>`
         )
         .join("");
     }
@@ -815,6 +858,65 @@
       b.hidden = false;
     }
 
+    _setMode(mode) {
+      this._mode = mode;
+      this.$("app").dataset.mode = mode;
+      if (mode !== "view") this._exitImmersive();
+      this.$("title").readOnly = mode === "view";
+      this.$("title").tabIndex = mode === "view" ? -1 : 0;
+    }
+
+    _done() {
+      if (this._dirty) {
+        if (!confirm("Leave without saving your changes?")) return;
+        this.$("editor").value = this._cur.html;
+        this.$("title").value = this._cur.title;
+        this._dirty = false;
+        this.$("save").disabled = true;
+        this._banner(null);
+        this._renderPreview();
+      }
+      this._setMode("view");
+    }
+
+    _enterImmersive() {
+      if (!this._cur || this._mode !== "view") return;
+      this.$("app").classList.add("immersive");
+      this.$("exit").hidden = false;
+      this._onKey = (e) => {
+        if (e.key === "Escape") this._exitImmersive();
+      };
+      window.addEventListener("keydown", this._onKey);
+      // Real fullscreen where the browser allows it (hides Home Assistant's own chrome); the
+      // fixed-position layout above is the fallback (iOS, some webviews).
+      this._onFs = () => {
+        if (!document.fullscreenElement && this.$("app").classList.contains("immersive")) this._exitImmersive(true);
+      };
+      document.addEventListener("fullscreenchange", this._onFs);
+      try {
+        const p = this.requestFullscreen && this.requestFullscreen();
+        if (p && p.catch) p.catch(() => {});
+      } catch (err) {
+        /* fallback layout is already active */
+      }
+    }
+
+    _exitImmersive(fromBrowser) {
+      if (!this._built) return;
+      this.$("app").classList.remove("immersive");
+      this.$("exit").hidden = true;
+      if (this._onKey) window.removeEventListener("keydown", this._onKey);
+      if (this._onFs) document.removeEventListener("fullscreenchange", this._onFs);
+      this._onKey = this._onFs = null;
+      if (!fromBrowser && document.fullscreenElement === this) {
+        try {
+          document.exitFullscreen();
+        } catch (err) {
+          /* already out */
+        }
+      }
+    }
+
     async _guardedOpen(id) {
       if (this._cur && this._cur.id === id) return;
       if (this._dirty && !confirm("Discard unsaved changes?")) return;
@@ -832,7 +934,7 @@
       localStorage.setItem(LS_LAST, id);
       this.$("editor").value = this._cur.html;
       this.$("title").value = this._cur.title;
-      for (const el of ["editor", "title", "hist", "perms", "del"]) this.$(el).disabled = false;
+      for (const el of ["editor", "title", "hist", "perms", "del", "edit", "full"]) this.$(el).disabled = false;
       this.$("save").disabled = true;
       this._banner(null);
       this._renderMeta();
@@ -849,7 +951,7 @@
       const wants = (r.entities || []).length || (r.services || []).length || r.notify || r.network;
       pill.hidden = !wants;
       pill.className = "pill " + (needs ? "pending" : "ok");
-      pill.textContent = needs ? "Permissions requested" : "Permissions approved";
+      pill.textContent = needs ? "Needs approval" : "Approved";
     }
 
     _renderPreview() {
@@ -933,6 +1035,7 @@
       try {
         await this._ws("save", { artifact_id: id, html: STARTER(name), title: name });
         await this._open(id);
+        this._setMode("edit");
       } catch (err) {
         this._toast(err.message || "Could not create artifact");
       }
@@ -1006,8 +1109,9 @@
         this._dirty = false;
         this.$("editor").value = "";
         this.$("title").value = "";
-        for (const el of ["editor", "title", "hist", "perms", "del", "save"]) this.$(el).disabled = true;
+        for (const el of ["editor", "title", "hist", "perms", "del", "save", "edit", "full"]) this.$(el).disabled = true;
         this.$("pill").hidden = true;
+        this._setMode("list");
         this.$("preview").innerHTML = '<div class="empty">Artifact deleted.</div>';
         this._banner(null);
       } else if (isCur && !this._saving) {
@@ -1036,11 +1140,33 @@
 
   class HtmlArtifactCard extends HTMLElement {
     setConfig(config) {
-      if (!config || !config.artifact) throw new Error("Set 'artifact' to the id of an artifact");
+      if (!config) throw new Error("Invalid configuration");
+      // An empty id is fine: the visual editor opens before anything is chosen.
+      const changed =
+        this._config && (this._config.artifact !== config.artifact || String(this._config.height) !== String(config.height));
       this._config = config;
+      if (changed) {
+        // the editor changed the artifact or height: rebuild the preview (also when the card
+        // was showing the "choose an artifact" hint and had no runner yet)
+        if (this._runner) this._runner.destroy();
+        this._runner = null;
+        if (this._root) this._root.getElementById("host").replaceChildren();
+        this._ensure();
+      }
     }
 
-    static getStubConfig() {
+    static getConfigElement() {
+      return document.createElement("html-artifact-card-editor");
+    }
+
+    static async getStubConfig(hass) {
+      // Preselect the first artifact so a freshly added card shows something right away.
+      try {
+        const { artifacts } = await hass.connection.sendMessagePromise({ type: WS + "list" });
+        if (artifacts && artifacts.length) return { artifact: artifacts[0].id, height: 500 };
+      } catch (err) {
+        /* fall through to the empty stub */
+      }
       return { artifact: "", height: 500 };
     }
 
@@ -1072,6 +1198,10 @@
           "<style>:host{display:block}ha-card{overflow:hidden}.err{padding:16px;color:var(--error-color,#b00020)}</style>" +
           '<ha-card><div id="host"></div></ha-card>';
       }
+      if (!this._config.artifact) {
+        this._root.getElementById("host").innerHTML = '<div class="err" style="color:var(--secondary-text-color)">Choose an artifact in the card settings.</div>';
+        return;
+      }
       const auto = String(this._config.height).toLowerCase() === "auto";
       this._runner = new ArtifactRunner({
         hass: this._hass,
@@ -1086,11 +1216,23 @@
 
     async _load() {
       const host = this._root.getElementById("host");
+      const get = (id) => this._hass.connection.sendMessagePromise({ type: WS + "get", artifact_id: id });
+      const slug = (t) => String(t).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
       try {
-        const art = await this._hass.connection.sendMessagePromise({
-          type: WS + "get",
-          artifact_id: this._config.artifact,
-        });
+        let art;
+        try {
+          art = await get(this._config.artifact);
+        } catch (err) {
+          // People often type the title instead of the id: accept a title (or its slug) too.
+          const { artifacts } = await this._hass.connection.sendMessagePromise({ type: WS + "list" });
+          const want = String(this._config.artifact).trim().toLowerCase();
+          const hit = artifacts.find((a) => a.id === this._config.artifact || a.title.trim().toLowerCase() === want || slug(a.title) === slug(want));
+          if (!hit) {
+            const ids = artifacts.map((a) => a.id).join(", ") || "none yet";
+            throw new Error(`${(err && err.message) || "not found"}. Use the artifact's id (available: ${ids})`);
+          }
+          art = await get(hit.id);
+        }
         this._runner.mount(art);
       } catch (err) {
         host.innerHTML = `<div class="err">Artifact "${esc(this._config.artifact)}" could not be loaded: ${esc((err && err.message) || "error")}</div>`;
@@ -1098,6 +1240,89 @@
     }
   }
 
+  // ------------------------------------------------------------------------
+  // Visual editor for the card (Dashboard > Edit > Add card > HTML Artifact)
+  // ------------------------------------------------------------------------
+
+  const EDITOR_HTML = `
+    <style>
+      :host { display: block; }
+      label { display: grid; gap: 4px; margin: 0 0 16px; font-size: 14px; color: var(--secondary-text-color); }
+      select, input { font: inherit; color: var(--primary-text-color); background: var(--card-background-color); border: 1px solid var(--divider-color); border-radius: 8px; padding: 10px 12px; width: 100%; box-sizing: border-box; }
+      .hint { font-size: 12px; color: var(--secondary-text-color); margin-top: -10px; }
+      .err { color: var(--error-color, #b00020); font-size: 13px; margin-bottom: 12px; }
+    </style>
+    <div id="err" class="err" hidden></div>
+    <label>Artifact<select id="art"></select></label>
+    <label>Height<input id="height" placeholder="500"></label>
+    <div class="hint">A number of pixels, or <b>auto</b> to size to the page. Default 500.</div>
+  `;
+
+  class HtmlArtifactCardEditor extends HTMLElement {
+    constructor() {
+      super();
+      this._config = {};
+      this._artifacts = null;
+    }
+
+    setConfig(config) {
+      this._config = config || {};
+      this._render();
+    }
+
+    set hass(hass) {
+      this._hass = hass;
+      if (!this._loading && this._artifacts === null) this._load();
+    }
+
+    async _load() {
+      this._loading = true;
+      try {
+        const { artifacts } = await this._hass.connection.sendMessagePromise({ type: WS + "list" });
+        this._artifacts = artifacts || [];
+        this._error = null;
+      } catch (err) {
+        this._artifacts = [];
+        this._error = "Could not load the artifact list: " + ((err && err.message) || "error");
+      }
+      this._render();
+    }
+
+    _render() {
+      if (!this._root) {
+        this._root = this.attachShadow({ mode: "open" });
+        this._root.innerHTML = EDITOR_HTML;
+        this._root.getElementById("art").onchange = (e) => this._emit({ artifact: e.target.value });
+        this._root.getElementById("height").onchange = (e) => {
+          const raw = e.target.value.trim().toLowerCase();
+          const n = Number(raw);
+          this._emit({ height: raw === "auto" ? "auto" : raw === "" ? undefined : Number.isFinite(n) && n > 0 ? Math.round(n) : this._config.height });
+        };
+      }
+      const sel = this._root.getElementById("art");
+      const current = this._config.artifact || "";
+      const known = new Set((this._artifacts || []).map((a) => a.id));
+      const opts = [`<option value="">${this._artifacts === null ? "Loading..." : "Choose an artifact"}</option>`];
+      (this._artifacts || []).forEach((a) => opts.push(`<option value="${esc(a.id)}">${esc(a.title)} (${esc(a.id)})</option>`));
+      if (current && !known.has(current) && this._artifacts !== null) opts.push(`<option value="${esc(current)}">${esc(current)} (not found)</option>`);
+      sel.innerHTML = opts.join("");
+      sel.value = current;
+      const h = this._root.getElementById("height");
+      if (this._root.activeElement !== h) h.value = this._config.height === undefined ? "" : String(this._config.height);
+      const err = this._root.getElementById("err");
+      err.hidden = !this._error;
+      err.textContent = this._error || "";
+    }
+
+    _emit(patch) {
+      const config = Object.assign({}, this._config, patch);
+      Object.keys(config).forEach((k) => config[k] === undefined && delete config[k]);
+      this._config = config;
+      this.dispatchEvent(new CustomEvent("config-changed", { detail: { config }, bubbles: true, composed: true }));
+    }
+  }
+
+  if (!customElements.get("html-artifact-card-editor")) customElements.define("html-artifact-card-editor", HtmlArtifactCardEditor);
   if (!customElements.get("html-artifacts-panel")) customElements.define("html-artifacts-panel", HtmlArtifactsPanel);
   if (!customElements.get("html-artifact-card")) {
     customElements.define("html-artifact-card", HtmlArtifactCard);

@@ -111,7 +111,17 @@ consistently for everyone. For artifacts with the **notify** permission granted:
 
 Notifications go to the services chosen under **Configure**, or a persistent notification if none.
 
+## The panel
+
+Open **Artifacts** in the sidebar. Picking an artifact shows the page **full size**; the toolbar has
+**Edit** (list, code editor and live preview side by side, with Save, history, Delete and Permissions),
+**Full screen** (hides Home Assistant's own chrome; **Esc** or the ✕ button exits) and **‹** back to the list.
+The orange *Needs approval* badge opens the permissions dialog.
+
 ## Dashboard card
+
+Add it from the dashboard editor (**Add card > HTML Artifact**) and pick the artifact and height in the visual editor,
+or use YAML:
 
 ```yaml
 type: custom:html-artifact-card
@@ -141,11 +151,12 @@ node tests/frontend_check.js                          # bridge protocol, CSP, he
 NODE_PATH=<jsdom>/node_modules node tests/example_pages.js   # example pages in jsdom through the real bridge
 <venv-with-homeassistant>/bin/python tests/smoke_ha.py        # real HA 2026.2: websocket, MCP tools, REST, notifications
 <venv-with-homeassistant>/bin/python tests/smoke_update.py    # real HA: update entity (GitHub faked)
+python tests/panel_layout.py [--shots DIR]                    # real Chromium (pip install playwright): panel modes, sizing, card + visual editor
 ```
 
 Verified against Home Assistant 2026.2.3: all modules import; websocket commands, the MCP tools
 (including their JSON-schema conversion), REST views, admin gating, and the timer to
-notification path run correctly. **Not yet verified:** the update entity against real GitHub and in the Updates UI, the panel and card in a real browser,
-panel registration and static file serving through a running HA, the config/options flow UI,
+notification path run correctly. **Not yet verified:** the update entity against real GitHub and in the Updates UI, the panel and card inside a running Home Assistant
+(layout is checked in headless Chromium with a fake `hass`), panel registration and static file serving through a running HA, the config/options flow UI,
 and how the companion apps render the notification payload (the Android `chronometer`/`when`
 countdown and action buttons follow the companion-app docs but are untested on a device).
