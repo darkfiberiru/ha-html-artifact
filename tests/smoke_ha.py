@@ -8,6 +8,7 @@ timer -> phone notification path with a real `HomeAssistant` object. It does not
 start the HTTP server or the frontend, so panel registration is not covered.
 """
 import asyncio
+import json
 import pathlib
 import sys
 import tempfile
@@ -208,6 +209,52 @@ async def main():
     assert res["version"] == 3 and res["updated_by"] == "claude"
     ok("Claude's publish flow: read, conflict on stale version, merge, publish")
 
+    # --- patch / metadata / render check --------------------------------------------------
+    assert {"artifact_patch", "artifact_check"} <= set(names), names
+    meta = await tool("artifact_read", artifact_id="cook", metadata_only=True)
+    assert "html" not in meta and meta["version"] == 3 and meta["size"] > 0 and "caps_requested" in meta, meta
+    listed = (await tool("artifact_list"))["artifacts"]
+    assert all("size" in a and "version" in a for a in listed)
+    ok("artifact_read(metadata_only) returns version, size and capabilities without html")
+
+    res = await tool("artifact_patch", artifact_id="cook", base_version=3,
+                     edits=[{"old_str": "<p>merged</p>", "new_str": "<p>patched</p><script>localStorage.x=1</script>"}])
+    assert res["version"] == 4 and "html" not in res, res
+    assert any(w["code"] == "storage" for w in res["lint"]), res["lint"]
+    full = await tool("artifact_read", artifact_id="cook")
+    assert "<p>patched</p>" in full["html"] and "<p>one, edited by hand</p>" in full["html"]
+    res = await tool("artifact_patch", artifact_id="cook", base_version=4, edits=[{"old_str": "<p>", "new_str": "<q>"}])
+    assert res["error"] == "edit_failed" and res["matches"] >= 2, res
+    res = await tool("artifact_patch", artifact_id="cook", base_version=1, edits=[{"old_str": "patched", "new_str": "x"}])
+    assert res["error"] == "conflict" and res["current"]["version"] == 4, res
+    assert (await tool("artifact_read", artifact_id="cook", metadata_only=True))["version"] == 4, "failed patches change nothing"
+    ok("artifact_patch: applies edits, lints, rejects ambiguous edits and stale versions")
+
+    res = await tool("artifact_check", artifact_id="cook", wait_seconds=0)
+    assert res["version"] == 4 and res["render"]["status"] == "pending" and "hint" in res["render"], res
+    assert any(w["code"] == "storage" for w in res["lint"])
+
+    # a browser reports while artifact_check is waiting for it
+    async def browser_reports():
+        await asyncio.sleep(0.3)
+        r = await ws("report", artifact_id="cook", version=4, source="dry-run", settled=True,
+                     errors=[{"level": "error", "message": "ReferenceError: x is not defined", "line": 7}])
+        assert r["success"] and r["result"] == {"stale": False}, r
+
+    waiter = asyncio.create_task(tool("artifact_check", artifact_id="cook", wait_seconds=5))
+    await browser_reports()
+    res = await asyncio.wait_for(waiter, 5)
+    assert res["render"]["status"] == "errors" and res["render"]["errors"][0]["line"] == 7, res
+    assert res["render"]["reported_by"] == ["dry-run"]
+    r = await ws("report", artifact_id="cook", version=3, source="viewer", settled=True)
+    assert r["result"]["stale"] is True, r
+    r = await ws("report", artifact_id="nope", version=1, source="viewer", settled=True)
+    assert not r["success"] and r["error"]["code"] == "not_found", r
+    res = await tool("artifact_patch", artifact_id="cook", base_version=4, edits=[{"old_str": "<script>localStorage.x=1</script>", "new_str": ""}])
+    res = await tool("artifact_check", artifact_id="cook", wait_seconds=0)
+    assert res["version"] == 5 and res["render"]["status"] == "pending", "a new version starts without the old report"
+    ok("artifact_check waits for a browser report, reports errors with lines, ignores stale versions")
+
     res = await tool("artifact_kv_set", artifact_id="cook", key="notes", value={"a": [1, 2]})
     res = await tool("artifact_kv_get", artifact_id="cook")
     assert res["values"] == {"notes": {"a": [1, 2]}}
@@ -222,9 +269,10 @@ async def main():
 
     # --- REST views ----------------------------------------------------------------------
     class Req(dict):
-        def __init__(self, body=None, admin=True):
+        def __init__(self, body=None, admin=True, query=None):
             super().__init__(hass_user=SimpleNamespace(name="Script", is_admin=admin))
             self._body = body
+            self.query = query or {}
 
         async def json(self):
             return self._body
@@ -239,6 +287,22 @@ async def main():
     assert resp.status == 200
     resp = await view.get(Req(), "rest-page")
     assert resp.status == 200 and b"again" in resp.body
+    resp = await view.get(Req(query={"metadata": "1"}), "rest-page")
+    meta = json.loads(resp.body)
+    assert resp.status == 200 and "html" not in meta and meta["version"] == 2 and meta["size"] > 0, meta
+    resp = await view.patch(Req({"base_version": 2, "edits": [{"old_str": "again", "new_str": "patched"}]}), "rest-page")
+    body = json.loads(resp.body)
+    assert resp.status == 200 and body["version"] == 3 and "html" not in body, body
+    resp = await view.patch(Req({"base_version": 3, "edits": [{"old_str": "nothere", "new_str": "x"}]}), "rest-page")
+    assert resp.status == 422 and json.loads(resp.body)["error"] == "edit_failed"
+    resp = await view.patch(Req({"base_version": 1, "edits": [{"old_str": "patched", "new_str": "x"}]}), "rest-page")
+    assert resp.status == 409
+    resp = await view.patch(Req({"edits": [{"old_str": "patched", "new_str": "x"}]}), "rest-page")
+    assert resp.status == 409
+    resp = await view.patch(Req({"base_version": 3}), "rest-page")
+    assert resp.status == 400
+    resp = await view.get(Req(), "rest-page")
+    assert b"patched" in resp.body
     resp = await listing.get(Req())
     assert resp.status == 200
     resp = await view.get(Req(), "missing")
@@ -247,7 +311,7 @@ async def main():
     assert resp.status == 403
     resp = await view.delete(Req(admin=True), "rest-page")
     assert resp.status == 200
-    ok("REST: create, 409 on missing base_version, read, list, 404, admin-only delete")
+    ok("REST: create, 409 on missing base_version, metadata read, PATCH edits (200/409/422/400), list, 404, admin-only delete")
 
     # delete cascades to timers
     await ws("delete", artifact_id="cook")
