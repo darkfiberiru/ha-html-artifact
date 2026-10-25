@@ -1500,6 +1500,7 @@
         return {
           id: "dry-run", artifact_id: art.id, label: (p && p.label) || "", state: "idle",
           duration: (p && p.duration) || 0, steps: (p && p.steps) || [], elapsed_now: 0, notify_targets: [],
+          remaining: 0, current_index: -1, next_index: null, next_in: 0, multi: false, tracks: [], join: null, waiting: [], history: [],
         };
       default:
         return null;
