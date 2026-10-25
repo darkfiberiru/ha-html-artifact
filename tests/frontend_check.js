@@ -83,7 +83,10 @@ const ok = (name, fn) => Promise.resolve().then(fn).then(() => { passed++; conso
   const parent = { postMessage: (m) => posted.push(m) };
   const bwin = { addEventListener: (t, fn) => t === "message" && listeners.push(fn) };
   const root = { setAttribute() {}, style: { setProperty() {} } };
-  const sandbox = { parent, window: bwin, document: { documentElement: root }, performance: { now: () => now }, console };
+  const sandbox = {
+    parent, window: bwin, document: { documentElement: root }, performance: { now: () => now }, console,
+    TextDecoder, Blob, URL: { createObjectURL: (b) => "blob:test/" + b.size },
+  };
   vm.createContext(sandbox);
   vm.runInContext("(" + T.bridgeMain.toString() + ")()", sandbox);
   const ha = bwin.ha;
@@ -180,6 +183,30 @@ const ok = (name, fn) => Promise.resolve().then(fn).then(() => { passed++; conso
     deliver({ event: { type: "state", entity_id: "sensor.oven", state: { state: "180" } } });
     deliver({ event: { type: "state", entity_id: "sensor.other", state: { state: "1" } } });
     assert.deepStrictEqual(states, [["sensor.oven", "20"], ["sensor.oven", "180"]]);
+  });
+
+  await ok("assets: get as text/json/blob, url is cached", async () => {
+    const enc = (t) => { const u = new TextEncoder().encode(t); return u.buffer.slice(u.byteOffset, u.byteOffset + u.byteLength); };
+    const p = ha.assets.get("data/a.json", "json");
+    let msg = posted[posted.length - 1];
+    assert.deepStrictEqual([msg.method, msg.params.path], ["assets.get", "data/a.json"]);
+    deliver({ id: msg.id, result: { buffer: enc('{"n":3}'), type: "application/json" } });
+    assert.strictEqual((await p).n, 3);
+
+    const t = ha.assets.get("notes.txt", "text");
+    deliver({ id: posted[posted.length - 1].id, result: { buffer: enc("hello"), type: "text/plain" } });
+    assert.strictEqual(await t, "hello");
+
+    const u1 = ha.assets.url("img/x.png");
+    const u2 = ha.assets.url("img/x.png");
+    assert.strictEqual(u1, u2, "same promise for the same path");
+    msg = posted[posted.length - 1];
+    deliver({ id: msg.id, result: { buffer: new ArrayBuffer(7), type: "image/png" } });
+    assert.strictEqual(await u1, "blob:test/7");
+
+    const missing = ha.assets.get("nope.png");
+    deliver({ id: posted[posted.length - 1].id, error: { code: "not_found", message: "asset 'nope.png' does not exist" } });
+    await assert.rejects(missing, (e) => e.code === "not_found");
   });
 
   console.log(`\n${passed} frontend checks passed`);

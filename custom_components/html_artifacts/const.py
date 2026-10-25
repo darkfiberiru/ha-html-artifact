@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 DOMAIN = "html_artifacts"
-VERSION = "0.2.2"
+VERSION = "0.3.0"
 
 PANEL_URL_PATH = "html-artifacts"
 PANEL_ELEMENT = "html-artifacts-panel"

@@ -7,9 +7,11 @@ phone notifications.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
-from dataclasses import dataclass
+from functools import partial
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from homeassistant.components import frontend, panel_custom
@@ -30,6 +32,7 @@ from .const import (
     STATIC_URL,
     VERSION,
 )
+from .assets import AssetStore
 from .core import ArtifactError, ArtifactStore, TimerEngine
 from .http import async_register_http
 from .llm_api import ArtifactsAPI
@@ -46,10 +49,22 @@ class Runtime:
     artifacts: ArtifactStore
     timers: TimerEngine
     notifier: TimerNotifier
+    assets: AssetStore | None = None
+    hass: HomeAssistant | None = None
+    _asset_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
     def delete_artifact(self, artifact_id: str) -> None:
         self.artifacts.delete(artifact_id)
         self.timers.delete_for_artifact(artifact_id)
+        if self.assets is not None and self.hass is not None:
+            self.hass.async_add_executor_job(self.assets.delete, artifact_id, None)
+
+    async def async_assets(self, func, *args, **kwargs):
+        """Run a blocking AssetStore call in the executor, one at a time."""
+        if self.assets is None or self.hass is None:
+            raise ArtifactError("not_loaded", "asset storage is not set up")
+        async with self._asset_lock:
+            return await self.hass.async_add_executor_job(partial(func, *args, **kwargs))
 
 
 def make_scheduler(hass: HomeAssistant):
@@ -110,7 +125,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     entry.async_on_unload(hass.bus.async_listen("mobile_app_notification_action", on_notification_action))
 
-    hass.data[DOMAIN]["runtime"] = Runtime(artifacts, timers, notifier)
+    assets = AssetStore(hass.config.path(DOMAIN))
+    hass.data[DOMAIN]["runtime"] = Runtime(artifacts, timers, notifier, assets, hass)
 
     url = f"{STATIC_URL}/{JS_FILE}?v={VERSION}"
     hass.data[DOMAIN]["js_url"] = url

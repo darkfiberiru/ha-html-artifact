@@ -95,6 +95,7 @@
     const firedSubs = new Set();
     const entitySubs = [];
     const timers = new Map();
+    const assetUrls = new Map();
 
     const post = (msg) => parent.postMessage(Object.assign({ ha: 1 }, msg), "*");
     const call = (method, params) =>
@@ -273,6 +274,25 @@
       },
       callService: (domain, service, data, target) => call("service.call", { domain, service, data, target }),
       notify: (message, title) => call("notify", { message, title }),
+      assets: {
+        list: () => call("assets.list"),
+        async get(path, as) {
+          const r = await call("assets.get", { path });
+          const kind = as || "arraybuffer";
+          if (kind === "arraybuffer") return r.buffer;
+          if (kind === "blob") return new Blob([r.buffer], { type: r.type || "" });
+          const text = new TextDecoder().decode(r.buffer);
+          return kind === "json" ? JSON.parse(text) : text;
+        },
+        url(path) {
+          if (!assetUrls.has(path)) {
+            const p = ha.assets.get(path, "blob").then((b) => URL.createObjectURL(b));
+            p.catch(() => assetUrls.delete(path));
+            assetUrls.set(path, p);
+          }
+          return assetUrls.get(path);
+        },
+      },
     };
 
     ha.ready = call("hello").then((info) => {
@@ -398,10 +418,32 @@
       return { dark, vars };
     }
 
-    _post(msg) {
+    _post(msg, transfer) {
       if (this.iframe && this.iframe.contentWindow) {
-        this.iframe.contentWindow.postMessage(Object.assign({ ha: 1 }, msg), "*");
+        this.iframe.contentWindow.postMessage(Object.assign({ ha: 1 }, msg), "*", transfer || []);
       }
+    }
+
+    async _fetchAsset(path) {
+      if (typeof path !== "string" || !path) {
+        throw Object.assign(new Error("asset path must be a non-empty string"), { code: "invalid" });
+      }
+      const url =
+        "/api/html_artifacts/" + encodeURIComponent(this.artifact.id) + "/assets/" +
+        path.replace(/^\/+/, "").split("/").map(encodeURIComponent).join("/");
+      const res = this.hass.fetchWithAuth
+        ? await this.hass.fetchWithAuth(url)
+        : await fetch(url, { headers: { Authorization: "Bearer " + this.hass.auth.data.access_token } });
+      if (!res.ok) {
+        let message = "HTTP " + res.status;
+        try {
+          message = (await res.json()).message || message;
+        } catch (e) {
+          /* not JSON */
+        }
+        throw Object.assign(new Error(message), { code: res.status === 404 ? "not_found" : "error" });
+      }
+      return { buffer: await res.arrayBuffer(), type: res.headers.get("content-type") || "" };
     }
 
     _ws(type, extra) {
@@ -435,7 +477,8 @@
       if (!m.id) return;
       try {
         const result = await this._dispatch(m.method, m.params || {});
-        this._post({ id: m.id, result: result === undefined ? null : result });
+        const transfer = result && result.buffer instanceof ArrayBuffer ? [result.buffer] : [];
+        this._post({ id: m.id, result: result === undefined ? null : result }, transfer);
       } catch (err) {
         const e2 = err || {};
         this._post({ id: m.id, error: { code: e2.code || "error", message: e2.message || String(err) } });
@@ -542,6 +585,10 @@
         case "notify":
           await this._ws("notify", { title: p.title, message: p.message });
           return true;
+        case "assets.list":
+          return await this._ws("assets/list");
+        case "assets.get":
+          return await this._fetchAsset(p.path);
         default:
           throw Object.assign(new Error("unknown method " + method), { code: "unknown_method" });
       }

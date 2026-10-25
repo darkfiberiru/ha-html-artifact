@@ -6,13 +6,19 @@ artifacts. The same code backs the REST API in http.py.
 """
 from __future__ import annotations
 
+import base64
+import binascii
+
+import aiohttp
 import voluptuous as vol
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import llm
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.util.json import JsonObjectType
 
 from .const import DOMAIN, LLM_API_ID
+from .assets import MAX_TOTAL_BYTES
 from .core import ArtifactError
 
 AUTHORING_GUIDE = """\
@@ -38,7 +44,8 @@ WORKFLOW
    (patterns allow * and ?; "network": true allows external images and fetch)
 
 PAGE RULES
-- One file, no build step. External scripts only from cdnjs.cloudflare.com,
+- One file (max 2 MB), no build step. Put anything bulky (images, 3D models,
+  data files) in ASSET FILES below instead of data: URIs. External scripts only from cdnjs.cloudflare.com,
   cdn.jsdelivr.net or unpkg.com; fonts from Google Fonts.
 - Works on phones: viewport meta, 16px gutters, large tap targets.
 - Respect the theme: the root element gets data-theme="light|dark", and the CSS
@@ -73,6 +80,28 @@ window.ha API (all methods return promises unless noted)
   ha.entities.subscribe(ids, cb)            cb(state, entityId) now and on change
   ha.callService(domain, service, data, target)   needs `services` grant
   ha.notify(message, title)                 needs `notify` grant
+  ha.assets.list()                          -> {files: [{path, size, sha256, content_type}], ...}
+  ha.assets.get(path[, as])                 as = "arraybuffer" (default) | "text" | "json" | "blob"
+  await ha.assets.url(path)                 -> a blob: URL for <img>, <video>, CSS, fonts
+      The page's own asset files (no grant needed). They are fetched through the
+      panel, so they work with the default no-network policy.
+
+ASSET FILES (per artifact, on the HA server, not versioned)
+  Paths: letters, digits, . _ - and "/" folders, e.g. "img/plan.webp",
+  "models/base.stl". Allowed types: images, audio/video, json/txt/csv/md/css/js,
+  fonts, pdf, stl/obj/glb/gltf/3mf/bin. Limits: 8 MB per file, 64 MB and 1000
+  files per artifact. Publish the page first; assets belong to an existing artifact.
+  Uploading, cheapest first:
+  1. artifact_assets_import with source "inbox:<name>.zip": a zip already placed in
+     <config>/html_artifacts/inbox/ (e.g. copied there over a shared folder). The
+     data never passes through the conversation.
+  2. artifact_assets_import with an http(s) URL of a zip that HA can reach (LAN ok).
+  3. artifact_asset_put with base64 data, in chunks of up to ~3 MB decoded: offset
+     0 first, then offset = bytes received so far, final=true on the last chunk
+     (optionally with sha256 to verify). Every byte goes through your context, so
+     use it for small files.
+  artifact_assets_list shows size and sha256 of every file; artifact_asset_delete
+  removes one ("*" removes all).
 
 Timer states: idle, running, paused, finished.
 Events on the HA bus: html_artifacts_timer_step, html_artifacts_timer_finished
@@ -264,6 +293,144 @@ class TimerControlTool(_Tool):
         return {"timer": timer}
 
 
+def _need_artifact(rt, artifact_id: str) -> None:
+    if not rt.artifacts.exists(artifact_id):
+        raise ArtifactError("not_found", f"artifact '{artifact_id}' does not exist: publish the page first")
+
+
+class AssetsListTool(_Tool):
+    name = "artifact_assets_list"
+    description = "List an artifact's asset files (path, size, sha256, content_type) and the limits."
+    parameters = vol.Schema({vol.Required("artifact_id"): str})
+
+    @_guard
+    async def async_call(self, hass, tool_input, llm_context) -> JsonObjectType:
+        rt = _rt(hass)
+        aid = tool_input.tool_args["artifact_id"]
+        _need_artifact(rt, aid)
+        return await rt.async_assets(rt.assets.list, aid)
+
+
+class AssetPutTool(_Tool):
+    name = "artifact_asset_put"
+    description = (
+        "Upload one asset file as base64, whole or in chunks (offset 0 first, then offset = "
+        "bytes received so far; final=true on the last chunk moves it into place; sha256 "
+        "optional). Every byte passes through the conversation: prefer artifact_assets_import "
+        "for anything big."
+    )
+    parameters = vol.Schema(
+        {
+            vol.Required("artifact_id"): str,
+            vol.Required("path"): str,
+            vol.Required("data_base64"): str,
+            vol.Optional("offset"): vol.Coerce(int),
+            vol.Optional("final"): bool,
+            vol.Optional("sha256"): str,
+        }
+    )
+
+    @_guard
+    async def async_call(self, hass, tool_input, llm_context) -> JsonObjectType:
+        args = tool_input.tool_args
+        rt = _rt(hass)
+        _need_artifact(rt, args["artifact_id"])
+        try:
+            data = base64.b64decode(args["data_base64"], validate=True)
+        except (binascii.Error, ValueError) as err:
+            raise ArtifactError("invalid", f"data_base64 is not valid base64: {err}") from err
+        return await rt.async_assets(
+            rt.assets.put,
+            args["artifact_id"],
+            args["path"],
+            data,
+            offset=args.get("offset", 0),
+            final=args.get("final", True),
+            sha256=args.get("sha256"),
+        )
+
+
+class AssetsImportTool(_Tool):
+    name = "artifact_assets_import"
+    description = (
+        "Import asset files from a zip without sending them through the conversation. "
+        "source = 'inbox:<name>.zip' for a zip in <config>/html_artifacts/inbox/ (removed "
+        "after a successful import unless keep=true), or an http(s) URL of a zip that Home "
+        "Assistant can reach. prefix puts the files under a folder; replace=true deletes the "
+        "artifact's existing assets first."
+    )
+    parameters = vol.Schema(
+        {
+            vol.Required("artifact_id"): str,
+            vol.Required("source"): str,
+            vol.Optional("prefix"): str,
+            vol.Optional("replace"): bool,
+            vol.Optional("keep"): bool,
+        }
+    )
+
+    @_guard
+    async def async_call(self, hass, tool_input, llm_context) -> JsonObjectType:
+        args = tool_input.tool_args
+        rt = _rt(hass)
+        aid = args["artifact_id"]
+        _need_artifact(rt, aid)
+        source = args["source"].strip()
+        inbox_file = None
+        if source.startswith(("http://", "https://")):
+            data = await _download(hass, source)
+        elif source.startswith("inbox:"):
+            inbox_file = await rt.async_assets(rt.assets.inbox_file, source[len("inbox:"):])
+            data = await hass.async_add_executor_job(inbox_file.read_bytes)
+        else:
+            raise ArtifactError("invalid", "source must be 'inbox:<name>.zip' or an http(s) URL")
+        result = await rt.async_assets(
+            rt.assets.import_zip, aid, data, prefix=args.get("prefix", ""), replace=bool(args.get("replace"))
+        )
+        if inbox_file is not None and not args.get("keep"):
+            await hass.async_add_executor_job(inbox_file.unlink)
+            result["removed_from_inbox"] = str(inbox_file)
+        return result
+
+
+class AssetDeleteTool(_Tool):
+    name = "artifact_asset_delete"
+    description = "Delete one asset file of an artifact, or all of them with path '*'."
+    parameters = vol.Schema({vol.Required("artifact_id"): str, vol.Required("path"): str})
+
+    @_guard
+    async def async_call(self, hass, tool_input, llm_context) -> JsonObjectType:
+        args = tool_input.tool_args
+        rt = _rt(hass)
+        _need_artifact(rt, args["artifact_id"])
+        path = None if args["path"].strip() == "*" else args["path"]
+        removed = await rt.async_assets(rt.assets.delete, args["artifact_id"], path)
+        return {"removed": removed}
+
+
+async def _download(hass: HomeAssistant, url: str) -> bytes:
+    """GET a zip, refusing anything bigger than the per-artifact asset limit."""
+    session = async_get_clientsession(hass)
+    limit = MAX_TOTAL_BYTES * 2
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=120)) as resp:
+            if resp.status >= 400:
+                raise ArtifactError("invalid", f"{url} returned HTTP {resp.status}")
+            if resp.content_length and resp.content_length > limit:
+                raise ArtifactError("too_large", f"download is larger than {limit} bytes")
+            chunks, size = [], 0
+            async for chunk in resp.content.iter_chunked(1 << 16):
+                size += len(chunk)
+                if size > limit:
+                    raise ArtifactError("too_large", f"download is larger than {limit} bytes")
+                chunks.append(chunk)
+            return b"".join(chunks)
+    except ArtifactError:
+        raise
+    except Exception as err:  # noqa: BLE001 - surface network errors to the caller
+        raise ArtifactError("invalid", f"could not download {url}: {err}") from err
+
+
 class ArtifactsAPI(llm.API):
     """The LLM API registered with Home Assistant."""
 
@@ -274,5 +441,6 @@ class ArtifactsAPI(llm.API):
         tools: list[llm.Tool] = [
             GuideTool(), ListTool(), ReadTool(), PublishTool(), KvGetTool(), KvSetTool(),
             TimerListTool(), TimerCreateTool(), TimerControlTool(),
+            AssetsListTool(), AssetPutTool(), AssetsImportTool(), AssetDeleteTool(),
         ]
         return llm.APIInstance(api=self, api_prompt=SHORT_PROMPT, llm_context=llm_context, tools=tools)

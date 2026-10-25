@@ -23,8 +23,9 @@ from voluptuous_openapi import convert  # noqa: E402
 
 from custom_components.html_artifacts import Runtime, make_scheduler  # noqa: E402
 from custom_components.html_artifacts.const import CONF_LIVE, CONF_NOTIFY_TARGETS, DOMAIN, EVENT_FINISHED, EVENT_STEP  # noqa: E402
+from custom_components.html_artifacts.assets import AssetStore  # noqa: E402
 from custom_components.html_artifacts.core import ArtifactStore, TimerEngine  # noqa: E402
-from custom_components.html_artifacts.http import ArtifactListView, ArtifactView  # noqa: E402
+from custom_components.html_artifacts.http import ArtifactListView, ArtifactView, AssetListView, AssetView  # noqa: E402
 from custom_components.html_artifacts.llm_api import ArtifactsAPI  # noqa: E402
 from custom_components.html_artifacts.notifier import TimerNotifier  # noqa: E402
 from custom_components.html_artifacts.websocket_api import async_register_websocket  # noqa: E402
@@ -71,7 +72,8 @@ async def main():
     timers = TimerEngine(Store(hass, 1, f"{DOMAIN}.timers"), time.time, make_scheduler(hass))
     notifier = TimerNotifier(hass, artifacts, entry)
     timers.add_listener(notifier.handle)
-    hass.data[DOMAIN] = {"runtime": Runtime(artifacts, timers, notifier)}
+    assets = AssetStore(hass.config.path(DOMAIN))
+    hass.data[DOMAIN] = {"runtime": Runtime(artifacts, timers, notifier, assets, hass)}
 
     sent = []
 
@@ -220,6 +222,96 @@ async def main():
     assert len(res["timers"]) == 1
     ok("LLM kv and timer tools")
 
+    # --- asset files over MCP ------------------------------------------------------------
+    import base64, hashlib, io, os, zipfile  # noqa: E401
+
+    res = await tool("artifact_assets_list", artifact_id="ghost")
+    assert res["error"] == "not_found", res
+    blob = os.urandom(5000)
+    b64 = base64.b64encode(blob).decode()
+    res = await tool("artifact_asset_put", artifact_id="cook", path="models/base.stl", data_base64=b64[:4000], final=False)
+    assert res == {"path": "models/base.stl", "received": 3000, "final": False}, res
+    res = await tool("artifact_asset_put", artifact_id="cook", path="models/base.stl", data_base64=b64[4000:],
+                     offset=3000, final=True, sha256=hashlib.sha256(blob).hexdigest())
+    assert res["final"] and res["size"] == 5000 and res["content_type"] == "model/stl", res
+    res = await tool("artifact_asset_put", artifact_id="cook", path="x.png", data_base64="not base64!!")
+    assert res["error"] == "invalid", res
+
+    inbox = assets.inbox
+    inbox.mkdir(parents=True, exist_ok=True)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("img/plan.webp", b"RIFF....WEBP")
+        zf.writestr("data/parts.json", b'{"n": 2}')
+    (inbox / "cook.zip").write_bytes(buf.getvalue())
+    res = await tool("artifact_assets_import", artifact_id="cook", source="inbox:cook.zip", prefix="pack")
+    assert res["imported"] == 2 and res["count"] == 3 and not (inbox / "cook.zip").exists(), res
+    res = await tool("artifact_assets_import", artifact_id="cook", source="/etc/passwd")
+    assert res["error"] == "invalid", res
+
+    from aiohttp import web as aweb  # serve a zip on localhost, like a LAN share would
+    zbuf = io.BytesIO()
+    with zipfile.ZipFile(zbuf, "w") as zf:
+        zf.writestr("from-url.txt", b"over http")
+    app = aweb.Application()
+    app.router.add_get("/bundle.zip", lambda request: aweb.Response(body=zbuf.getvalue()))
+    runner = aweb.AppRunner(app)
+    await runner.setup()
+    site = aweb.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    import aiohttp
+    from custom_components.html_artifacts import llm_api as llm_mod
+    plain_session = aiohttp.ClientSession()
+    llm_mod.async_get_clientsession = lambda _hass: plain_session  # the test hass has no network component
+    res = await tool("artifact_assets_import", artifact_id="cook", source=f"http://127.0.0.1:{port}/bundle.zip", prefix="web")
+    assert res["imported"] == 1, res
+    res = await tool("artifact_assets_import", artifact_id="cook", source=f"http://127.0.0.1:{port}/missing.zip")
+    assert res["error"] == "invalid" and "404" in res["message"], res
+    await runner.cleanup()
+    await plain_session.close()
+    res = await tool("artifact_asset_delete", artifact_id="cook", path="web/from-url.txt")
+    assert res["removed"] == 1, res
+    res = await tool("artifact_assets_list", artifact_id="cook")
+    assert [f["path"] for f in res["files"]] == ["models/base.stl", "pack/data/parts.json", "pack/img/plan.webp"], res
+    r = await ws("assets/list", artifact_id="cook")
+    assert r["success"] and r["result"]["count"] == 3, r
+    ok("MCP assets: chunked base64 put with sha256, zip import from the inbox and from a URL, delete, list (ws too)")
+
+    class AReq(dict):
+        def __init__(self, body=b"", admin=True, query=None, headers=None):
+            super().__init__(hass_user=SimpleNamespace(name="Script", is_admin=admin))
+            self.content_length = len(body)
+            self.query = query or {}
+            self.headers = headers or {}
+            stream = io.BytesIO(body)
+
+            class _C:
+                async def read(self, n=-1):
+                    return stream.read(n)
+
+            self.content = _C()
+
+    aview = AssetView(hass)
+    resp = await aview.get(AReq(), "cook", "models/base.stl")
+    assert resp.status == 200 and resp.body == blob and resp.content_type == "model/stl", resp
+    etag = resp.headers["ETag"]
+    resp = await aview.get(AReq(headers={"If-None-Match": etag}), "cook", "models/base.stl")
+    assert resp.status == 304
+    resp = await aview.put(AReq(b"hello"), "cook", "notes.txt")
+    assert resp.status == 200
+    resp = await aview.get(AReq(), "cook", "../../etc/passwd.txt")
+    assert resp.status == 400, resp.status
+    resp = await aview.get(AReq(), "cook", "nope.png")
+    assert resp.status == 404
+    resp = await aview.put(AReq(b"x"), "ghost", "a.txt")
+    assert resp.status == 404
+    resp = await AssetListView(hass).get(AReq(), "cook")
+    assert resp.status == 200 and b'"count": 4' in resp.body.replace(b'"count":4', b'"count": 4'), resp.body[:200]
+    resp = await aview.delete(AReq(), "cook", "notes.txt")
+    assert resp.status == 200
+    ok("REST assets: get with ETag/304, put, delete, path validation, 404s")
+
     # --- REST views ----------------------------------------------------------------------
     class Req(dict):
         def __init__(self, body=None, admin=True):
@@ -250,9 +342,13 @@ async def main():
     ok("REST: create, 409 on missing base_version, read, list, 404, admin-only delete")
 
     # delete cascades to timers
+    asset_dir = assets.root / "artifacts" / "cook"
+    assert asset_dir.is_dir()
     await ws("delete", artifact_id="cook")
     assert timers.list("cook") == []
-    ok("deleting an artifact deletes its timers")
+    await hass.async_block_till_done()
+    assert not asset_dir.exists(), "asset folder removed with the artifact"
+    ok("deleting an artifact deletes its timers and asset files")
 
     timers.async_shutdown()
     await hass.async_stop(force=True)

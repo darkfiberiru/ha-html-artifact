@@ -5,6 +5,11 @@
   PUT    /api/html_artifacts/<id>         publish {html, base_version?, title?, description?, icon?, capabilities?}
   DELETE /api/html_artifacts/<id>         delete (admin)
 
+  GET    /api/html_artifacts/<id>/assets           list asset files
+  GET    /api/html_artifacts/<id>/assets/<path>    file bytes (the page gets them through ha.assets)
+  PUT    /api/html_artifacts/<id>/assets/<path>    upload a file (raw body; ?sha256= optional)
+  DELETE /api/html_artifacts/<id>/assets/<path>    delete a file
+
 An update must carry the `base_version` that was read; a stale one gets a 409
 with the current content so the caller can merge hand edits before retrying.
 """
@@ -16,6 +21,7 @@ from homeassistant.components.http import HomeAssistantView
 from homeassistant.core import HomeAssistant
 
 from .const import DOMAIN
+from .assets import MAX_FILE_BYTES
 from .core import ArtifactError
 
 _STATUS = {
@@ -103,6 +109,76 @@ class ArtifactView(_Base):
         return self.json({})
 
 
+class AssetListView(_Base):
+    url = "/api/html_artifacts/{artifact_id}/assets"
+    name = "api:html_artifacts:assets"
+
+    async def get(self, request: web.Request, artifact_id: str) -> web.Response:
+        try:
+            rt = self._runtime()
+            if not rt.artifacts.exists(artifact_id):
+                raise ArtifactError("not_found", f"artifact '{artifact_id}' does not exist")
+            return self.json(await rt.async_assets(rt.assets.list, artifact_id))
+        except ArtifactError as err:
+            return self._fail(err)
+
+
+class AssetView(_Base):
+    url = "/api/html_artifacts/{artifact_id}/assets/{path:.+}"
+    name = "api:html_artifacts:asset"
+
+    def _existing(self, artifact_id: str):
+        rt = self._runtime()
+        if not rt.artifacts.exists(artifact_id):
+            raise ArtifactError("not_found", f"artifact '{artifact_id}' does not exist")
+        return rt
+
+    async def get(self, request: web.Request, artifact_id: str, path: str) -> web.Response:
+        try:
+            rt = self._existing(artifact_id)
+            data, entry = await rt.async_assets(rt.assets.read, artifact_id, path)
+        except ArtifactError as err:
+            return self._fail(err)
+        etag = f'"{entry["sha256"]}"'
+        if request.headers.get("If-None-Match") == etag:
+            return web.Response(status=304, headers={"ETag": etag})
+        return web.Response(
+            body=data,
+            content_type=entry["content_type"].split(";")[0],
+            headers={
+                "ETag": etag,
+                "Cache-Control": "private, no-cache",
+                "X-Content-Type-Options": "nosniff",
+                "Content-Security-Policy": "sandbox; default-src 'none'",
+            },
+        )
+
+    async def put(self, request: web.Request, artifact_id: str, path: str) -> web.Response:
+        try:
+            rt = self._existing(artifact_id)
+            if request.content_length and request.content_length > MAX_FILE_BYTES:
+                raise ArtifactError("too_large", f"file is larger than {MAX_FILE_BYTES} bytes")
+            data = await request.content.read(MAX_FILE_BYTES + 1)
+            if len(data) > MAX_FILE_BYTES:
+                raise ArtifactError("too_large", f"file is larger than {MAX_FILE_BYTES} bytes")
+            entry = await rt.async_assets(
+                rt.assets.put, artifact_id, path, data, sha256=request.query.get("sha256")
+            )
+        except ArtifactError as err:
+            return self._fail(err)
+        return self.json(entry)
+
+    async def delete(self, request: web.Request, artifact_id: str, path: str) -> web.Response:
+        try:
+            rt = self._existing(artifact_id)
+            await rt.async_assets(rt.assets.delete, artifact_id, path)
+        except ArtifactError as err:
+            return self._fail(err)
+        return self.json({})
+
+
 def async_register_http(hass: HomeAssistant) -> None:
     hass.http.register_view(ArtifactListView(hass))
     hass.http.register_view(ArtifactView(hass))
+    hass.http.register_view(AssetListView(hass))
+    hass.http.register_view(AssetView(hass))

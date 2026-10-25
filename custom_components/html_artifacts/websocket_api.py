@@ -144,6 +144,23 @@ def ws_kv_list(rt, connection, msg):
     return {"values": rt.artifacts.kv_all(msg["artifact_id"])}
 
 
+# -- asset files ---------------------------------------------------------------------
+
+@api("assets/list", AID)
+async def ws_assets_list(rt, connection, msg):
+    if not rt.artifacts.exists(msg["artifact_id"]):
+        raise ArtifactError("not_found", f"artifact '{msg['artifact_id']}' does not exist")
+    return await rt.async_assets(rt.assets.list, msg["artifact_id"])
+
+
+@api("assets/delete", {**AID, vol.Required("path"): str}, admin=True)
+async def ws_assets_delete(rt, connection, msg):
+    if not rt.artifacts.exists(msg["artifact_id"]):
+        raise ArtifactError("not_found", f"artifact '{msg['artifact_id']}' does not exist")
+    await rt.async_assets(rt.assets.delete, msg["artifact_id"], msg["path"])
+    return {}
+
+
 # -- timers ------------------------------------------------------------------------
 
 @api("timers/list", {vol.Optional("artifact_id"): str})
@@ -240,6 +257,7 @@ def async_register_websocket(hass: HomeAssistant) -> None:
     for handler in (
         ws_list, ws_get, ws_save, ws_delete, ws_history, ws_revert, ws_set_grants,
         ws_kv_get, ws_kv_set, ws_kv_delete, ws_kv_list,
+        ws_assets_list, ws_assets_delete,
         ws_timers_list, ws_timers_create, ws_timers_control,
         ws_notify, ws_subscribe,
     ):
