@@ -160,6 +160,7 @@ def ws_timers_list(rt, connection, msg):
         vol.Optional("duration"): vol.Any(int, float, None),
         vol.Optional("start"): bool,
         vol.Optional("notify_targets"): vol.Any([str], None),
+        vol.Optional("tracks"): vol.Any([vol.Any(dict, str)], None),
     },
 )
 def ws_timers_create(rt, connection, msg):
@@ -172,6 +173,7 @@ def ws_timers_create(rt, connection, msg):
         msg.get("duration"),
         msg.get("notify_targets"),
         bool(msg.get("start")),
+        tracks=msg.get("tracks"),
     )
     return {"timer": timer}
 
@@ -181,9 +183,11 @@ def ws_timers_create(rt, connection, msg):
     {
         **AID,
         vol.Required("timer_id"): str,
-        vol.Required("action"): vol.In(["start", "pause", "resume", "reset", "skip", "extend", "delete"]),
+        vol.Required("action"): vol.In(["start", "pause", "resume", "reset", "skip", "extend", "answer", "delete"]),
         vol.Optional("to_index"): vol.Any(int, None),
         vol.Optional("seconds"): vol.Any(int, float, None),
+        vol.Optional("track"): vol.Any(str, None),
+        vol.Optional("answer"): vol.Any(str, int, float, bool, None),
     },
 )
 def ws_timers_control(rt, connection, msg):
@@ -193,6 +197,9 @@ def ws_timers_control(rt, connection, msg):
         artifact_id=msg["artifact_id"],
         to_index=msg.get("to_index"),
         seconds=msg.get("seconds"),
+        track=msg.get("track"),
+        answer=msg.get("answer"),
+        source="page",
     )
     return {"timer": timer}
 

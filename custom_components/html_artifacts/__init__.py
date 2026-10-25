@@ -82,6 +82,34 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     return True
 
 
+def handle_notification_action(timers: TimerEngine, action: str) -> bool:
+    """Run a phone notification button: HTMLART|<timer>|<verb>[|<track>[|<arg>]]."""
+    parts = action.split("|")
+    if len(parts) < 3 or len(parts) > 5 or parts[0] != ACTION_PREFIX:
+        return False
+    timer_id, verb = parts[1], parts[2]
+    track = parts[3] if len(parts) > 3 and parts[3] else None
+    arg = parts[4] if len(parts) > 4 else None
+    try:
+        if verb == "extend":
+            timers.extend(timer_id, 60, track=track, source="notification")
+        elif verb == "pause":
+            timers.pause(timer_id, track=track, source="notification")
+        elif verb == "resume":
+            timers.resume(timer_id, track=track, source="notification")
+        elif verb == "next":
+            timers.skip(timer_id, track=track, source="notification")
+        elif verb == "answer" and arg and ":" in arg:
+            index, _, value = arg.partition(":")
+            timers.answer(timer_id, int(index), value, source="notification")
+        else:
+            return False
+    except (ArtifactError, ValueError) as err:
+        _LOGGER.debug("Ignoring notification action %s: %s", parts, getattr(err, "message", err))
+        return False
+    return True
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     artifacts = ArtifactStore(Store(hass, 1, f"{DOMAIN}.artifacts"))
     await artifacts.async_load()
@@ -94,21 +122,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     @callback
     def on_notification_action(event: Event) -> None:
-        parts = str(event.data.get("action", "")).split("|")
-        if len(parts) != 3 or parts[0] != ACTION_PREFIX:
-            return
-        _, timer_id, verb = parts
-        try:
-            if verb == "extend":
-                timers.extend(timer_id, 60)
-            elif verb == "pause":
-                timers.pause(timer_id)
-            elif verb == "resume":
-                timers.resume(timer_id)
-            elif verb == "next":
-                timers.skip(timer_id)
-        except ArtifactError as err:
-            _LOGGER.debug("Ignoring notification action %s: %s", parts, err.message)
+        handle_notification_action(timers, str(event.data.get("action", "")))
 
     entry.async_on_unload(hass.bus.async_listen("mobile_app_notification_action", on_notification_action))
 

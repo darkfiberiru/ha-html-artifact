@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 DOMAIN = "html_artifacts"
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 PANEL_URL_PATH = "html-artifacts"
 PANEL_ELEMENT = "html-artifacts-panel"
@@ -19,6 +19,7 @@ DEFAULT_REPO = "darkfiberiru/ha-html-artifact"
 
 EVENT_STEP = "html_artifacts_timer_step"
 EVENT_FINISHED = "html_artifacts_timer_finished"
+EVENT_GATE = "html_artifacts_timer_gate"
 
 # Notification action ids look like "HTMLART|<timer_id>|<verb>".
 ACTION_PREFIX = "HTMLART"

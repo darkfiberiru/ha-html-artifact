@@ -53,7 +53,7 @@ update, with release notes and an **Install** button. After installing, restart 
 **MCP (recommended).** Add HA's *Model Context Protocol Server* integration and select the
 **HTML Artifacts** API, then point Claude Desktop / Claude Code at it. Claude gets
 `artifact_authoring_guide`, `artifact_list`, `artifact_read`, `artifact_publish`, `artifact_patch`, `artifact_check`,
-`artifact_kv_get/set` and `artifact_timer_list/create/control`. If your MCP server setup only allows one API at a
+`artifact_kv_get/set` (`prefix` filters the key list) and `artifact_timer_list/create/control` (`create` takes `tracks`, step `gate`/`duration`/`after`; `control` takes `track` and the `answer` action). `artifact_read` accepts `include_html=false`; `artifact_patch` accepts `old`/`new` as well as `old_str`/`new_str`. If your MCP server setup only allows one API at a
 time, use REST below.
 
 **REST.** `PUT /api/html_artifacts/<id>` with a long-lived token (see `tools/publish.py`):
@@ -101,7 +101,19 @@ ha.timers.subscribe(timers => ...);          // every change, from any device
 const v = ha.timers.view(timers[0]);         // live: elapsed, remaining, current, next, nextIn
 await ha.timers.pause(t.id);  resume  reset  skip(id[, toIndex])  extend(id, 60)  remove
 ha.timers.fromDurations([{label: "Preheat", seconds: 240}, ...]);   // -> {steps, duration}
-ha.timers.onFired(({kind, step}) => ...);    // while the page is open
+ha.timers.onFired(({kind, track, step}) => ...);   // while the page is open
+
+// parallel lanes, activities, and "cook until done" gates (see below)
+await ha.timers.create({ label: "Tikka Tilapia", start: true,
+  tracks: [{id: "rice", label: "Rice"}, {id: "fish", label: "Fish"}],
+  steps: [
+    {track: "rice", at: 0,   label: "Start the rice", duration: 960},
+    {track: "fish", at: 600, label: "Simmer", duration: 480, endLabel: "Simmer done"},
+    {track: "fish", at: 1080, label: "Check the fish",
+     gate: {question: "145F?", yes: "Done", more: [60, 120]}},
+    {track: "*", label: "Serve"}]});            // join: fires when both lanes are finished
+await ha.timers.extend(id, 60, {track: "fish"});   // pause/resume/skip take {track} too
+await ha.timers.answer(id, stepIndex, "yes");      // or 60 = cook 60 s more
 
 // entities and services (need approval)
 ha.entities.subscribe(["sensor.oven_*"], (state, entityId) => ...);
@@ -113,6 +125,22 @@ The root element gets `data-theme="light|dark"` and the HA CSS variables, so pag
 theme. `ha.timers.view` counts from when the snapshot arrived, so phone and tablet clocks never
 need to agree. The full reference Claude reads is `AUTHORING_GUIDE` in `llm_api.py`.
 
+### Lanes, activities and gates
+
+- **Tracks.** Steps with a `track` run on their own lane with their own offset: extending, pausing or skipping one lane
+  leaves the others alone (without `{track}` the call applies to every lane, exactly as before). Steps with no track share
+  one implicit lane, so existing pages are unchanged. A **join** step (`track: "*"` or `after: ["rice","fish"]`) fires
+  only when every listed lane is finished. `view.tracks` lists each lane (`current`, `next`, `nextIn`, `remaining`,
+  `offset`, `state`); the top-level `current/next/nextIn` stay the soonest event across lanes.
+- **Activities.** A step `duration` makes it an activity: `view.current.remaining` is the time left in it (the phone shows
+  `Simmer 9:40`), and an optional `endLabel` alerts when it ends.
+- **Gates.** `gate: {question, yes, more: [60,120], autoYesAfter}` pauses that lane until answered, from the page
+  (`ha.timers.answer`) or the phone (**Done / +1 min / +2 min**). A "+N" pushes the lane back N seconds and asks again.
+  `view.current.waiting` is true meanwhile, and `html_artifacts_timer_gate` fires on the bus.
+- **History.** `timer.history` records every start, pause, resume, extend, skip and answer (time, lane, step, source) and
+  finished timers are kept for 7 days, so a page can log "planned 27 min, took 31". `html_artifacts_timer_finished`
+  carries the history for automations.
+
 ### Timers and your phone
 
 A timer's step times are fixed offsets, so pausing, extending (`+1 min`) and skipping adjust them
@@ -121,7 +149,11 @@ consistently for everyone. For artifacts with the **notify** permission granted:
 - an alert fires as each step is reached (time-sensitive on iOS, high priority on Android), with **+1 min** and **Pause** buttons;
 - an ongoing notification shows the current/next step with a native countdown (Android `chronometer`) and **Next step / +1 min / Pause**; it clears when the timer ends;
 - if HA was down when a step came due, only the latest step is announced, noting how many passed;
-- every step also fires `html_artifacts_timer_step` / `html_artifacts_timer_finished` on the event bus for automations.
+- every step also fires `html_artifacts_timer_step` / `html_artifacts_timer_finished` on the event bus for automations;
+- timers with lanes get one ongoing notification listing every active lane (`Fish: Simmer 9:40 · Rice: Steaming 3:10`,
+  the numbers as of the last update; the native countdown follows the soonest event), lane-named alerts
+  (`Rice — Rice ready`), and **+1 min / Next / Pause** buttons that act on the lane that just fired. A gate shows its
+  question with **Done / +1 min / +2 min** until answered.
 
 Notifications go to the services chosen under **Configure**, or a persistent notification if none.
 
@@ -154,6 +186,7 @@ height: 520        # or: auto
 ## Examples
 
 `examples/cook-timer.html` is a cook-along with a server-side timer and shared ingredient check-offs.
+`examples/cook-lanes.html` runs rice and fish as parallel lanes with activity countdowns, a "check the fish" gate and a join step.
 `examples/house-board.html` has nothing to do with cooking: live temperatures, light toggles and notes
 shared by the household.
 

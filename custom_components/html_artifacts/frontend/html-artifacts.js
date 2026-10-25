@@ -147,23 +147,74 @@
     };
 
     function view(t) {
-      const dt = t.state === "running" ? (performance.now() - t._recv) / 1000 : 0;
-      const elapsed = Math.min(t.duration, t.elapsed_now + dt);
-      let cur = -1;
-      t.steps.forEach((s, i) => {
-        if (s.at <= elapsed + 0.25) cur = i;
-      });
-      const nxt = cur + 1 < t.steps.length ? cur + 1 : -1;
-      const nextAt = nxt >= 0 ? t.steps[nxt].at : t.duration;
-      return Object.assign({}, t, {
-        elapsed,
-        remaining: Math.max(0, t.duration - elapsed),
-        currentIndex: cur,
-        current: cur >= 0 ? t.steps[cur] : null,
-        nextIndex: nxt,
-        next: nxt >= 0 ? t.steps[nxt] : null,
-        nextIn: Math.max(0, nextAt - elapsed),
-      });
+      if (t && t._raw) t = t._raw; // already a view (pages often pass back what create() returned)
+      const running = t.state === "running";
+      const dt = running ? (performance.now() - t._recv) / 1000 : 0;
+      const steps = t.steps;
+      const laneView = (l) => {
+        const live = running && l.state === "running";
+        const adj = live ? dt : 0;
+        const waiting = l.waiting != null;
+        const base = l.current_index >= 0 ? steps[l.current_index] : null;
+        const remaining = l.remaining == null ? null : Math.max(0, l.remaining - adj);
+        return {
+          id: l.id,
+          label: l.label,
+          state: l.state,
+          offset: l.offset,
+          currentIndex: l.current_index,
+          current: base ? Object.assign({}, base, { remaining, waiting, track: l.id }) : null,
+          nextIndex: l.next_index == null ? -1 : l.next_index,
+          next: l.next_index == null ? null : steps[l.next_index],
+          nextKind: l.next_kind || null,
+          nextIn: l.next_in == null ? null : Math.max(0, l.next_in - adj),
+          remaining,
+          waiting,
+          gate: l.gate || null,
+          autoIn: l.auto_in == null ? null : Math.max(0, l.auto_in - adj),
+        };
+      };
+      const lanes = (t.tracks || []).map(laneView);
+      const join = t.join ? laneView(t.join) : null;
+      const hasExtras = !!(t.multi || steps.some((s) => s.gate || s.duration || s.after));
+      let top;
+      if (!hasExtras) {
+        // A plain flat timer: derive everything from the clock, as it always has.
+        const elapsed = Math.min(t.duration, t.elapsed_now + dt);
+        let cur = -1;
+        steps.forEach((s, i) => {
+          if (s.at <= elapsed + 0.25) cur = i;
+        });
+        const nxt = cur + 1 < steps.length ? cur + 1 : -1;
+        const nextAt = nxt >= 0 ? steps[nxt].at : t.duration;
+        top = {
+          elapsed,
+          remaining: Math.max(0, t.duration - elapsed),
+          currentIndex: cur,
+          current: cur >= 0 ? steps[cur] : null,
+          nextIndex: nxt,
+          next: nxt >= 0 ? steps[nxt] : null,
+          nextIn: Math.max(0, nextAt - elapsed),
+        };
+      } else {
+        const waitingAny = (t.waiting || []).length > 0;
+        const all = join ? lanes.concat([join]) : lanes;
+        const owner = all.find((l) => l.currentIndex === t.current_index && l.currentIndex >= 0);
+        const nextOwner = all.find((l) => l.nextIndex === t.next_index && l.nextIndex >= 0 && l.state !== "waiting");
+        const adj = running && (nextOwner || !waitingAny) ? dt : 0;
+        top = {
+          elapsed: t.elapsed_now + dt,
+          remaining: Math.max(0, t.remaining - (running && !waitingAny ? dt : 0)),
+          currentIndex: t.current_index,
+          current: t.current_index >= 0 ? (owner && owner.current) || steps[t.current_index] : null,
+          nextIndex: t.next_index == null ? -1 : t.next_index,
+          next: t.next_index == null ? null : steps[t.next_index],
+          nextIn: Math.max(0, t.next_in - adj),
+        };
+      }
+      const out = Object.assign({}, t, top, { tracks: lanes, join, waiting: t.waiting || [] });
+      Object.defineProperty(out, "_raw", { value: t, enumerable: false });
+      return out;
     }
     const snapshot = () => Array.from(timers.values()).map(view);
     const emitTimers = () => {
@@ -204,7 +255,9 @@
           }
           break;
         case "timer_fired":
-          firedSubs.forEach((cb) => cb({ kind: ev.kind, timer: view(stamp(ev.timer)), step: ev.step, index: ev.index, missed: ev.missed }));
+          firedSubs.forEach((cb) =>
+            cb({ kind: ev.kind, phase: ev.phase || "start", track: ev.track || null, timer: view(stamp(ev.timer)), step: ev.step, index: ev.index, missed: ev.missed })
+          );
           break;
         case "state":
           entitySubs.forEach((s) => {
@@ -264,17 +317,22 @@
         create: (opts) => call("timer.create", opts || {}).then(keep),
         list: () => call("timer.list").then((list) => list.map(keep)),
         start: (id) => control(id, "start"),
-        pause: (id) => control(id, "pause"),
-        resume: (id) => control(id, "resume"),
+        pause: (id, opts) => control(id, "pause", { track: opts && opts.track }),
+        resume: (id, opts) => control(id, "resume", { track: opts && opts.track }),
         reset: (id) => control(id, "reset"),
-        skip: (id, toIndex) => control(id, "skip", { to_index: toIndex }),
-        extend: (id, seconds) => control(id, "extend", { seconds }),
+        // skip(id), skip(id, toIndex) or skip(id, { track })
+        skip: (id, arg) =>
+          control(id, "skip", typeof arg === "object" && arg ? { track: arg.track, to_index: arg.toIndex } : { to_index: arg }),
+        extend: (id, seconds, opts) => control(id, "extend", { seconds, track: opts && opts.track }),
+        // Answer a check gate: answer(id, stepIndex, "yes") or answer(id, stepIndex, 60) for 60 more seconds.
+        answer: (id, stepIndex, answer) => control(id, "answer", { to_index: stepIndex, answer }),
         remove: (id) => control(id, "delete"),
         view,
         fromDurations(items) {
           let at = 0;
           const steps = items.map((it) => {
-            const step = { at, label: it.label, detail: it.detail, notify: it.notify };
+            const step = { at, label: it.label, detail: it.detail, notify: it.notify, duration: it.seconds };
+            if (it.track) step.track = it.track;
             at += it.seconds;
             return step;
           });
@@ -619,6 +677,7 @@
               duration: p.duration,
               start: !!p.start,
               notify_targets: p.notify_targets,
+              tracks: p.tracks,
             })
           ).timer;
         case "timer.control":
@@ -628,6 +687,8 @@
               action: p.action,
               to_index: p.to_index,
               seconds: p.seconds,
+              track: p.track,
+              answer: p.answer,
             })
           ).timer;
         case "entities.get": {

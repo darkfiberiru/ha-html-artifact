@@ -586,18 +586,88 @@ class ArtifactStore(_Listeners):
 # Timer engine
 # --------------------------------------------------------------------------
 
-class TimerEngine(_Listeners):
-    """Server-side, restart-safe timers with milestone steps.
+DEFAULT_TRACK = "main"
+JOIN_TRACK = "*"
+TRACK_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+MAX_TRACKS = 10
+MAX_TIMER_LOG = 200
+MAX_REGATES = 30
+YES_WORDS = {"yes", "y", "done", "true", "ok"}
 
-    A timer has a total ``duration`` and ``steps``, each firing ``at`` an offset
-    (seconds since start). A step at offset 0 is shown immediately and not
-    announced. State is derived from ``elapsed`` (banked while paused) plus the
-    time since ``started_at``, so every client sees the same timer.
+
+def _normalize_tracks(raw: Any) -> list[dict]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or len(raw) > MAX_TRACKS:
+        raise ArtifactError("invalid", f"tracks must be a list of at most {MAX_TRACKS}")
+    out: list[dict] = []
+    for item in raw:
+        if isinstance(item, str):
+            item = {"id": item}
+        if not isinstance(item, dict):
+            raise ArtifactError("invalid", "each track must be an object like {id, label}")
+        tid = str(item.get("id", ""))
+        if not TRACK_ID_RE.match(tid):
+            raise ArtifactError("invalid", "track ids use letters, digits, - and _ (max 32 characters)")
+        if any(t["id"] == tid for t in out):
+            raise ArtifactError("invalid", f"track '{tid}' is listed twice")
+        out.append({"id": tid, "label": _clean_str(item.get("label") or tid, 60, "track label")})
+    return out
+
+
+def _normalize_gate(raw: Any) -> dict:
+    if raw is True:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ArtifactError("invalid", "gate must be an object like {question, yes, more}")
+    more_raw = raw.get("more", [60, 120])
+    if not isinstance(more_raw, list) or len(more_raw) > 2:
+        raise ArtifactError("invalid", "gate.more is a list of at most 2 extra-time options (seconds)")
+    more = []
+    for value in more_raw:
+        try:
+            seconds = int(value)
+        except (TypeError, ValueError) as err:
+            raise ArtifactError("invalid", "gate.more entries are numbers of seconds") from err
+        if not 1 <= seconds <= 3600:
+            raise ArtifactError("invalid", "gate.more entries must be between 1 and 3600 seconds")
+        more.append(seconds)
+    gate = {
+        "question": _clean_str(raw.get("question") or "Done yet?", 200, "gate question"),
+        "yes": _clean_str(raw.get("yes") or "Done", 40, "gate yes label"),
+        "more": more,
+    }
+    if raw.get("autoYesAfter") is not None:
+        try:
+            auto = float(raw["autoYesAfter"])
+        except (TypeError, ValueError) as err:
+            raise ArtifactError("invalid", "autoYesAfter must be a number of seconds") from err
+        if not 1 <= auto <= MAX_SECONDS:
+            raise ArtifactError("invalid", "autoYesAfter is out of range")
+        gate["autoYesAfter"] = auto
+    return gate
+
+
+class TimerEngine(_Listeners):
+    """Server-side, restart-safe timers with milestone steps, tracks and gates.
+
+    A timer has ``steps`` (each firing ``at`` seconds after start) grouped into
+    parallel *tracks*. The timer keeps one clock ``T`` (banked while the whole timer
+    is paused). Each track derives its own time from ``T``: ``T - held``, where
+    ``held`` is how long that track has been paused (by a check gate or by the user).
+    Steps without a track live on one implicit track, so flat timers behave exactly as
+    they always did.
+
+    A step may also have a ``duration`` (an activity, optionally announced when it ends
+    via ``endLabel``), a ``gate`` ("cook until done": pauses its track until answered)
+    or ``after`` (a join step that waits for other tracks to finish). A step at offset 0
+    is shown immediately and not announced.
 
     Events emitted to listeners:
-      {"type": "timer", "change": ..., "timer": view, "server_now": ...}
-      {"type": "timer_fired", "kind": "step" | "finished", "timer": view,
-       "step": {...} | None, "index": int | None, "missed": int}
+      {"type": "timer", "change": ..., "timer": view, "server_now": ..., [track, ...]}
+      {"type": "timer_fired", "kind": "step" | "gate" | "finished", "phase": "start" | "end",
+       "timer": view, "step": {...} | None, "index": int | None, "track": str | None,
+       "missed": int}
     """
 
     def __init__(
@@ -621,6 +691,7 @@ class TimerEngine(_Listeners):
         for tid, timer in (data.get("timers") or {}).items():
             if timer.get("state") == "finished" and now - timer.get("finished_at", now) > FINISHED_RETENTION:
                 continue
+            self._migrate(timer)
             self._timers[tid] = timer
         for timer in self._timers.values():
             if timer["state"] == "running":
@@ -634,27 +705,201 @@ class TimerEngine(_Listeners):
     def _save(self) -> None:
         self._store.async_delay_save(lambda: {"timers": self._timers}, 0.5)
 
-    # -- views -------------------------------------------------------------
+    @staticmethod
+    def _migrate(timer: dict) -> None:
+        """Bring a timer saved by an older version up to the track model."""
+        if "tstate" in timer:
+            return
+        steps = timer.get("steps") or []
+        for step in steps:
+            step.setdefault("track", DEFAULT_TRACK)
+            step.setdefault("plan_at", step["at"])
+        last = max((s["at"] for s in steps), default=0.0)
+        timer["tracks"] = [{"id": DEFAULT_TRACK, "label": "Main"}]
+        timer["multi"] = False
+        timer["auto_duration"] = abs(timer.get("duration", 0) - last) < EPS
+        timer["planned_duration"] = timer.get("duration", 0)
+        timer["history"] = []
+        timer["started_wall"] = timer.get("started_wall")
+        timer["tstate"] = {DEFAULT_TRACK: TimerEngine._new_tstate(timer.pop("fired", 0))}
+        timer.pop("fired", None)
+
+    @staticmethod
+    def _new_tstate(ev: int = 0) -> dict:
+        return {"ev": ev, "held": 0.0, "hold_since": None, "waiting": None, "manual": False,
+                "auto_at": None, "offset": 0.0, "regates": []}
+
+    # -- low-level model -----------------------------------------------------
+
+    @staticmethod
+    def _events(timer: dict, tid: str) -> list[tuple]:
+        """Sorted (time, order, kind, step index) tuples of one track."""
+        events: list[tuple] = []
+        for index, step in enumerate(timer["steps"]):
+            if step["track"] != tid:
+                continue
+            events.append((step["at"], 0, "start", index))
+            if step.get("duration") and step.get("endLabel") and not step.get("gate"):
+                events.append((step["at"] + step["duration"], 1, "end", index))
+        for regate in timer["tstate"][tid]["regates"]:
+            events.append((regate["at"], 0, "gate", regate["index"]))
+        events.sort(key=lambda e: (e[0], e[1], e[3]))
+        return events
+
+    @staticmethod
+    def _track_end(timer: dict, tid: str) -> float:
+        end = 0.0
+        for step in timer["steps"]:
+            if step["track"] == tid:
+                end = max(end, step["at"] + (0 if step.get("gate") else step.get("duration") or 0))
+        for regate in timer["tstate"][tid]["regates"]:
+            end = max(end, regate["at"])
+        return end
+
+    def _plan_end(self, timer: dict) -> float:
+        end = 0.0
+        for tid in timer["tstate"]:
+            end = max(end, self._track_end(timer, tid))
+        return end
 
     def _elapsed(self, timer: dict, now: float) -> float:
         elapsed = timer["elapsed"]
         if timer["state"] == "running":
             elapsed += now - timer["started_at"]
-        return max(0.0, min(elapsed, timer["duration"]))
+        return max(0.0, elapsed)
+
+    @staticmethod
+    def _tel(timer: dict, tid: str, big_t: float) -> float:
+        ts = timer["tstate"][tid]
+        if ts["hold_since"] is not None:
+            return max(0.0, ts["hold_since"] - ts["held"])
+        return max(0.0, big_t - ts["held"])
+
+    def _track_done(self, timer: dict, tid: str, big_t: float) -> bool:
+        ts = timer["tstate"][tid]
+        return (
+            ts["ev"] >= len(self._events(timer, tid))
+            and ts["waiting"] is None
+            and self._tel(timer, tid, big_t) >= self._track_end(timer, tid) - EPS
+        )
+
+    def _join_ready_at(self, timer: dict, step: dict) -> float | None:
+        """Timer-clock moment a join step can fire, or None while a dependency is blocked."""
+        ready = 0.0
+        for dep in step.get("after") or []:
+            ts = timer["tstate"].get(dep)
+            if ts is None:
+                continue
+            if ts["waiting"] is not None or ts["hold_since"] is not None:
+                return None
+            ready = max(ready, self._track_end(timer, dep) + ts["held"])
+        return ready
+
+    def _finished(self, timer: dict, big_t: float) -> bool:
+        longest = 0.0
+        for tid, ts in timer["tstate"].items():
+            if ts["waiting"] is not None or ts["ev"] < len(self._events(timer, tid)):
+                return False
+            longest = max(longest, self._tel(timer, tid, big_t))
+        return longest >= timer["duration"] - EPS
+
+    def _fix_duration(self, timer: dict, delta: float | None = None, big_t: float = 0.0) -> None:
+        if timer.get("auto_duration"):
+            timer["duration"] = max(1.0, self._plan_end(timer))
+        elif delta is not None:
+            timer["duration"] = max(big_t + 1.0, timer["duration"] + delta)
+        else:
+            timer["duration"] = max(timer["duration"], self._plan_end(timer))
+
+    def _log(self, timer: dict, action: str, now: float, **fields: Any) -> None:
+        entry = {"t": now, "action": action}
+        entry.update({k: v for k, v in fields.items() if v is not None})
+        history = timer.setdefault("history", [])
+        history.append(entry)
+        del history[:-MAX_TIMER_LOG]
+
+    # -- views -------------------------------------------------------------
+
+    def _track_view(self, timer: dict, tid: str, big_t: float, now: float) -> dict:
+        ts = timer["tstate"][tid]
+        steps = timer["steps"]
+        events = self._events(timer, tid)
+        el = self._tel(timer, tid, big_t)
+        ep = ts["ev"]
+        if tid != JOIN_TRACK and ts["waiting"] is None and ts["hold_since"] is None:
+            while ep < len(events) and events[ep][0] <= el + EPS:
+                ep += 1  # due but not announced yet: already "current" on screen
+        cur = events[ep - 1] if ep > 0 else None
+        nxt = events[ep] if ep < len(events) else None
+        end = self._track_end(timer, tid)
+        if timer["state"] == "idle":
+            state = "idle"
+        elif timer["state"] == "finished":
+            state = "finished"
+        elif ts["waiting"] is not None:
+            state = "waiting"
+        elif ts["hold_since"] is not None or timer["state"] == "paused":
+            state = "paused"
+        elif nxt is None and el >= end - EPS:
+            state = "done"
+        else:
+            state = "running"
+        next_in = None
+        if nxt is not None and state != "waiting":
+            if tid == JOIN_TRACK:
+                ready = self._join_ready_at(timer, steps[nxt[3]])
+                next_in = None if ready is None else max(0.0, max(nxt[0], ready) - big_t)
+            else:
+                next_in = max(0.0, nxt[0] - el)
+        remaining = None
+        current_index = cur[3] if cur else -1
+        if cur and cur[2] != "end" and not steps[current_index].get("gate") and steps[current_index].get("duration"):
+            remaining = max(0.0, steps[current_index]["at"] + steps[current_index]["duration"] - el)
+        waiting = ts["waiting"]
+        label = next((t["label"] for t in timer["tracks"] if t["id"] == tid), tid)
+        out = {
+            "id": tid,
+            "label": label,
+            "state": state,
+            "current_index": current_index,
+            "next_index": nxt[3] if nxt else None,
+            "next_kind": nxt[2] if nxt else None,
+            "next_in": None if next_in is None else round(next_in, 3),
+            "remaining": None if remaining is None else round(remaining, 3),
+            "elapsed": round(el, 3),
+            "offset": round(ts["offset"], 3),
+            "waiting": waiting,
+            "gate": copy.deepcopy(steps[waiting]["gate"]) if waiting is not None else None,
+        }
+        if waiting is not None and ts.get("auto_at") is not None:
+            out["auto_in"] = round(max(0.0, ts["auto_at"] - big_t), 3)
+        return out
 
     def view(self, timer: dict) -> dict[str, Any]:
         now = self._clock()
-        elapsed = self._elapsed(timer, now)
+        big_t = self._elapsed(timer, now)
         steps = timer["steps"]
-        current = -1
-        for index, step in enumerate(steps):
-            if step["at"] <= elapsed + EPS:
-                current = index
-        nxt = current + 1 if current + 1 < len(steps) else None
-        next_at = steps[nxt]["at"] if nxt is not None else timer["duration"]
-        next_in = max(0.0, next_at - elapsed)
-        remaining = max(0.0, timer["duration"] - elapsed)
         running = timer["state"] == "running"
+        views = {tid: self._track_view(timer, tid, big_t, now) for tid in timer["tstate"]}
+        longest = max((v["elapsed"] for v in views.values()), default=0.0)
+        remaining = max(0.0, timer["duration"] - longest)
+        # The soonest upcoming event across tracks drives the old top-level fields.
+        pick = None
+        for v in views.values():
+            if v["state"] in ("waiting",) or v["next_in"] is None or v["next_index"] is None:
+                continue
+            if pick is None or (v["next_in"], v["next_index"]) < (pick["next_in"], pick["next_index"]):
+                pick = v
+        waiting = [{"track": v["id"], "index": v["waiting"]} for v in views.values() if v["waiting"] is not None]
+        if pick is not None:
+            current, nxt, next_in = pick["current_index"], pick["next_index"], pick["next_in"]
+            if current < 0:
+                current = max((v["current_index"] for v in views.values()), default=-1)
+        elif waiting:
+            current, nxt, next_in = waiting[0]["index"], None, remaining
+        else:
+            current, nxt, next_in = max((v["current_index"] for v in views.values()), default=-1), None, remaining
+        real = [views[t["id"]] for t in timer["tracks"] if t["id"] in views]
         return {
             "id": timer["id"],
             "artifact_id": timer["artifact_id"],
@@ -664,14 +909,22 @@ class TimerEngine(_Listeners):
             "duration": timer["duration"],
             "notify_targets": list(timer.get("notify_targets") or []),
             "created": timer["created"],
-            "elapsed_now": round(elapsed, 3),
+            "elapsed_now": round(big_t, 3),
             "remaining": round(remaining, 3),
             "current_index": current,
             "next_index": nxt,
             "next_in": round(next_in, 3),
-            "next_due": now + next_in if running else None,
-            "ends_at": now + remaining if running else None,
+            "next_due": now + next_in if running and (nxt is not None or not waiting) else None,
+            "ends_at": now + remaining if running and not waiting else None,
             "server_now": now,
+            "multi": bool(timer.get("multi")),
+            "tracks": real,
+            "join": views.get(JOIN_TRACK),
+            "waiting": waiting,
+            "history": copy.deepcopy(timer.get("history") or []),
+            "planned_duration": timer.get("planned_duration", timer["duration"]),
+            "started_wall": timer.get("started_wall"),
+            "finished_wall": timer.get("finished_at"),
         }
 
     def list(self, artifact_id: str | None = None) -> list[dict]:
@@ -690,8 +943,17 @@ class TimerEngine(_Listeners):
             raise ArtifactError("not_found", f"timer '{timer_id}' does not exist")
         return timer
 
-    def _emit_state(self, timer: dict, change: str) -> None:
-        self._emit({"type": "timer", "change": change, "timer": self.view(timer), "server_now": self._clock()})
+    def _emit_state(self, timer: dict, change: str, **extra: Any) -> None:
+        event = {"type": "timer", "change": change, "timer": self.view(timer), "server_now": self._clock()}
+        event.update(extra)
+        self._emit(event)
+
+    def _track_arg(self, timer: dict, track: str | None) -> str | None:
+        if track is None or track == "":
+            return None
+        if track not in timer["tstate"] or track == JOIN_TRACK:
+            raise ArtifactError("invalid", f"timer has no track '{track}'")
+        return track
 
     # -- scheduling ----------------------------------------------------------
 
@@ -700,79 +962,190 @@ class TimerEngine(_Listeners):
         if cancel:
             cancel()
 
-    def _next_target(self, timer: dict) -> float:
-        steps, duration = timer["steps"], timer["duration"]
-        index = timer["fired"]
-        while index < len(steps):
-            if steps[index]["at"] < duration - EPS:
-                return steps[index]["at"]
-            index += 1
-        return duration
+    def _next_target(self, timer: dict) -> float | None:
+        """Timer-clock moment of the next thing that needs attention (None = nothing scheduled)."""
+        best: float | None = None
+        pending = False
+        for tid, ts in timer["tstate"].items():
+            if ts["waiting"] is not None:
+                pending = True
+                if ts.get("auto_at") is not None:
+                    best = ts["auto_at"] if best is None else min(best, ts["auto_at"])
+                continue
+            events = self._events(timer, tid)
+            if ts["ev"] >= len(events):
+                continue
+            pending = True
+            if ts["hold_since"] is not None:
+                continue
+            when = events[ts["ev"]][0] + ts["held"]
+            if tid == JOIN_TRACK:
+                ready = self._join_ready_at(timer, timer["steps"][events[ts["ev"]][3]])
+                if ready is None:
+                    continue
+                when = max(when, ready)
+            best = when if best is None else min(best, when)
+        if pending:
+            return best
+        ends = [timer["duration"] + ts["held"] for ts in timer["tstate"].values() if ts["hold_since"] is None]
+        return min(ends) if ends else None
 
     def _arm(self, timer: dict) -> None:
         self._disarm(timer["id"])
         if timer["state"] != "running":
             return
-        delay = max(0.0, self._next_target(timer) - self._elapsed(timer, self._clock()))
+        target = self._next_target(timer)
+        if target is None:
+            return
+        delay = max(0.0, target - self._elapsed(timer, self._clock()))
         timer_id = timer["id"]
         self._cancels[timer_id] = self._scheduler(delay, lambda: self._on_due(timer_id))
+
+    def _release(self, ts: dict, big_t: float) -> None:
+        if ts["hold_since"] is not None:
+            ts["held"] += max(0.0, big_t - ts["hold_since"])
+        ts.update(hold_since=None, waiting=None, manual=False, auto_at=None)
+
+    def _collect(self, timer: dict, big_t: float) -> tuple[list[dict], int | None, bool]:
+        """Consume every event that is due. Returns (fired, terminal step index, anything changed)."""
+        steps, duration = timer["steps"], timer["duration"]
+        fired: list[dict] = []
+        terminal: int | None = None
+        changed = False
+        while True:
+            best = None
+            for tid, ts in timer["tstate"].items():
+                if ts["hold_since"] is not None:
+                    if ts["waiting"] is not None and ts.get("auto_at") is not None and ts["auto_at"] <= big_t + EPS:
+                        cand = (ts["auto_at"], tid, "auto", None)
+                        if best is None or cand[0] < best[0]:
+                            best = cand
+                    continue
+                events = self._events(timer, tid)
+                if ts["ev"] >= len(events):
+                    continue
+                time_, _order, kind, index = events[ts["ev"]]
+                when = time_ + ts["held"]
+                if tid == JOIN_TRACK:
+                    ready = self._join_ready_at(timer, steps[index])
+                    if ready is None:
+                        continue
+                    when = max(when, ready)
+                if when > big_t + EPS:
+                    continue
+                if best is None or when < best[0]:
+                    best = (when, tid, kind, index)
+            if best is None:
+                break
+            when, tid, kind, index = best
+            ts = timer["tstate"][tid]
+            changed = True
+            if kind == "auto":
+                self._release(ts, when)
+                self._log(timer, "answer", self._clock(), track=tid, answer="auto", source="auto")
+                continue
+            ts["ev"] += 1
+            step = steps[index]
+            if kind in ("start", "gate") and step.get("gate"):
+                ts["hold_since"] = when
+                ts["waiting"] = index
+                auto = step["gate"].get("autoYesAfter")
+                ts["auto_at"] = when + auto if auto else None
+                fired.append({"kind": "gate", "phase": "start", "index": index, "track": tid, "t": when})
+                continue
+            if kind == "end":
+                fired.append({"kind": "step", "phase": "end", "index": index, "track": tid, "t": when})
+                continue
+            rest = all(
+                other["ev"] >= len(self._events(timer, other_id)) and other["waiting"] is None
+                for other_id, other in timer["tstate"].items()
+            )
+            if not step.get("duration") and ((tid == JOIN_TRACK and rest) or (tid != JOIN_TRACK and step["at"] >= duration - EPS)):
+                terminal = index  # the closing step is announced as "finished", not as a step
+                continue
+            fired.append({"kind": "step", "phase": "start", "index": index, "track": tid, "t": when})
+        return fired, terminal, changed
 
     def _on_due(self, timer_id: str) -> None:
         self._cancels.pop(timer_id, None)
         timer = self._timers.get(timer_id)
         if timer is None or timer["state"] != "running":
             return
-        now = self._clock()
-        elapsed = self._elapsed(timer, now)
-        steps, duration = timer["steps"], timer["duration"]
-        due: list[int] = []
-        while (
-            timer["fired"] < len(steps)
-            and steps[timer["fired"]]["at"] < duration - EPS
-            and steps[timer["fired"]]["at"] <= elapsed + EPS
-        ):
-            due.append(timer["fired"])
-            timer["fired"] += 1
-        if elapsed + EPS >= duration:
-            self._finish(timer, now)
-            return
+        self._settle(timer, self._clock(), None)
 
-        on_time = [i for i in due if steps[i]["at"] >= elapsed - LATE_AFTER]
-        missed = len(due) - len(on_time)
+    def _settle(self, timer: dict, now: float, change: str | None, **extra: Any) -> dict:
+        """Fire whatever is due, finish if everything is done, persist, re-arm, announce."""
+        big_t = self._elapsed(timer, now)
+        if timer["state"] == "running":
+            fired, terminal, _changed = self._collect(timer, big_t)
+        else:
+            fired, terminal = [], None
+        if timer["state"] == "running" and self._finished(timer, big_t):
+            ended = [f for f in fired if f["phase"] == "end"]
+            if terminal is None and ended:
+                terminal = ended[-1]["index"]
+            self._finish(timer, now, terminal)
+            return self.view(timer)
+
+        gates = [f for f in fired if f["kind"] == "gate"]
+        regular = [f for f in fired if f["kind"] != "gate"]
+        on_time = [f for f in regular if f["t"] >= big_t - LATE_AFTER]
+        missed = len(regular) - len(on_time)
         to_fire = on_time
-        if due and not on_time:  # woke up long after: announce only the latest step
-            to_fire = due[-1:]
-            missed = len(due) - 1
-        self._save()
-        self._emit_state(timer, "step" if due else "tick")
-        for n, index in enumerate(to_fire):
-            if steps[index].get("notify", True):
-                self._emit(
-                    {
-                        "type": "timer_fired",
-                        "kind": "step",
-                        "timer": self.view(timer),
-                        "step": copy.deepcopy(steps[index]),
-                        "index": index,
-                        "missed": missed if n == 0 else 0,
-                    }
-                )
-        self._arm(timer)
+        if regular and not on_time:  # woke up long after: announce only the latest step
+            to_fire = regular[-1:]
+            missed = len(regular) - 1
+        announce = sorted(to_fire + gates, key=lambda f: f["t"])
 
-    def _finish(self, timer: dict, now: float) -> None:
+        self._save()
+        self._arm(timer)
+        label = change or ("gate" if gates else "step" if fired else "tick")
+        self._emit_state(timer, label, **extra)
+        multi = bool(timer.get("multi"))
+        first = True
+        for item in announce:
+            step = timer["steps"][item["index"]]
+            if item["kind"] != "gate" and not step.get("notify", True):
+                continue
+            self._emit(
+                {
+                    "type": "timer_fired",
+                    "kind": item["kind"],
+                    "phase": item["phase"],
+                    "timer": self.view(timer),
+                    "step": copy.deepcopy(step),
+                    "index": item["index"],
+                    "track": item["track"] if multi else None,
+                    "missed": missed if first and item["kind"] != "gate" else 0,
+                }
+            )
+            if item["kind"] != "gate":
+                first = False
+        return self.view(timer)
+
+    def _finish(self, timer: dict, now: float, last_index: int | None = None) -> None:
         steps, duration = timer["steps"], timer["duration"]
-        last = steps[-1] if steps and steps[-1]["at"] >= duration - EPS else None
+        big_t = self._elapsed(timer, now)
+        if last_index is not None:
+            last = steps[last_index]
+        else:
+            last = steps[-1] if steps and steps[-1]["at"] >= duration - EPS else None
         self._disarm(timer["id"])
-        timer.update(state="finished", elapsed=duration, started_at=None, fired=len(steps), finished_at=now)
+        for ts in timer["tstate"].values():
+            ts.update(hold_since=None, waiting=None, auto_at=None, manual=False)
+        timer.update(state="finished", elapsed=max(big_t, duration), started_at=None, finished_at=now)
+        self._log(timer, "finish", now)
         self._save()
         self._emit_state(timer, "finish")
         self._emit(
             {
                 "type": "timer_fired",
                 "kind": "finished",
+                "phase": "start",
                 "timer": self.view(timer),
                 "step": copy.deepcopy(last),
-                "index": len(steps) - 1 if last else None,
+                "index": steps.index(last) if last is not None else None,
+                "track": None,
                 "missed": 0,
             }
         )
@@ -787,6 +1160,7 @@ class TimerEngine(_Listeners):
         duration: float | None = None,
         notify_targets: list[str] | None = None,
         start: bool = False,
+        tracks: list[dict] | None = None,
     ) -> dict:
         if len(self._timers) >= MAX_TIMERS:
             raise ArtifactError("limit", f"at most {MAX_TIMERS} timers")
@@ -794,33 +1168,99 @@ class TimerEngine(_Listeners):
         steps = steps or []
         if not isinstance(steps, list) or len(steps) > MAX_STEPS:
             raise ArtifactError("invalid", f"steps must be a list of at most {MAX_STEPS}")
-        normalized = []
+        declared = _normalize_tracks(tracks)
+        ids = [t["id"] for t in declared]
+
+        def known(tid: str) -> None:
+            if tid not in ids:
+                if len(ids) >= MAX_TRACKS:
+                    raise ArtifactError("invalid", f"at most {MAX_TRACKS} tracks")
+                ids.append(tid)
+                declared.append({"id": tid, "label": tid.replace("-", " ").replace("_", " ").title()})
+
+        multi = bool(declared)
+        prepared: list[tuple[dict, dict]] = []
         for raw in steps:
             if not isinstance(raw, dict):
                 raise ArtifactError("invalid", "each step must be an object")
+            track = raw.get("track")
+            after = raw.get("after")
+            join = track == JOIN_TRACK or after is not None
+            if not join and track not in (None, ""):
+                tid = str(track)
+                if not TRACK_ID_RE.match(tid):
+                    raise ArtifactError("invalid", "track ids use letters, digits, - and _ (max 32 characters)")
+                known(tid)
+                multi = True
+            elif join:
+                multi = True
+            prepared.append((raw, {"join": join}))
+        has_untracked = any(not info["join"] and raw.get("track") in (None, "") for raw, info in prepared)
+        if has_untracked or not ids:
+            known(DEFAULT_TRACK)
+
+        normalized = []
+        for raw, info in prepared:
+            join = info["join"]
+            auto_at = join and raw.get("at") is None
             try:
-                at = float(raw["at"])
+                at = float(raw["at"]) if "at" in raw and raw["at"] is not None else (0.0 if join else None)
+                if at is None:
+                    raise KeyError("at")
             except (KeyError, TypeError, ValueError) as err:
                 raise ArtifactError("invalid", "each step needs a numeric 'at' (seconds)") from err
             if not 0 <= at <= MAX_SECONDS:
                 raise ArtifactError("invalid", "step 'at' is out of range")
-            normalized.append(
-                {
-                    "at": at,
-                    "label": _clean_str(raw.get("label"), 120, "step label"),
-                    "detail": str(raw.get("detail") or "")[:500],
-                    "notify": bool(raw.get("notify", True)),
-                }
-            )
+            step: dict[str, Any] = {
+                "at": at,
+                "plan_at": at,
+                "label": _clean_str(raw.get("label"), 120, "step label"),
+                "detail": str(raw.get("detail") or "")[:500],
+                "notify": bool(raw.get("notify", True)),
+            }
+            if auto_at:
+                step["_auto_at"] = True
+            if join:
+                after = raw.get("after")
+                if after is None or after == JOIN_TRACK or after == [JOIN_TRACK]:
+                    deps = list(ids)
+                elif isinstance(after, list) and after and all(isinstance(a, str) for a in after):
+                    deps = [str(a) for a in after]
+                    for dep in deps:
+                        if dep not in ids:
+                            raise ArtifactError("invalid", f"'after' names unknown track '{dep}'")
+                else:
+                    raise ArtifactError("invalid", "'after' must be a list of track ids")
+                step.update(track=JOIN_TRACK, after=deps)
+            else:
+                tid = str(raw.get("track") or DEFAULT_TRACK)
+                step["track"] = tid
+            if raw.get("gate"):
+                step["gate"] = _normalize_gate(raw["gate"])
+            elif raw.get("duration") is not None:
+                try:
+                    span = float(raw["duration"])
+                except (TypeError, ValueError) as err:
+                    raise ArtifactError("invalid", "step duration must be a number of seconds") from err
+                if not 0 < span <= MAX_SECONDS:
+                    raise ArtifactError("invalid", "step duration is out of range")
+                step["duration"] = span
+                if raw.get("endLabel"):
+                    step["endLabel"] = _clean_str(raw["endLabel"], 120, "endLabel")
+            normalized.append(step)
+        plan_end = max((s["at"] + (s.get("duration") or 0) for s in normalized if "_auto_at" not in s), default=0.0)
+        for step in normalized:
+            if step.pop("_auto_at", False):
+                step["at"] = step["plan_at"] = plan_end  # a join with no time sorts after the work it waits for
         normalized.sort(key=lambda s: s["at"])
-        last = normalized[-1]["at"] if normalized else 0.0
+        last = max((s["at"] + (s.get("duration") or 0) for s in normalized), default=0.0)
         try:
             total = float(duration) if duration is not None else last
         except (TypeError, ValueError) as err:
             raise ArtifactError("invalid", "duration must be a number of seconds") from err
         if total <= 0 or total > MAX_SECONDS:
             raise ArtifactError("invalid", "duration must be between 1 second and 7 days")
-        if total < last:
+        if total < last - EPS:
             raise ArtifactError("invalid", "duration must not be shorter than the last step")
         targets = [str(t) for t in (notify_targets or [])][:10]
 
@@ -830,15 +1270,22 @@ class TimerEngine(_Listeners):
             "artifact_id": artifact_id,
             "label": label,
             "steps": normalized,
+            "tracks": declared,
+            "multi": multi,
             "duration": total,
+            "planned_duration": total,
+            "auto_duration": duration is None,
             "notify_targets": targets,
             "state": "idle",
             "elapsed": 0.0,
             "started_at": None,
-            "fired": 0,
             "created": self._clock(),
             "finished_at": None,
+            "started_wall": None,
+            "history": [],
+            "tstate": {},
         }
+        self._init_tstate(timer)
         self._timers[timer_id] = timer
         self._save()
         self._emit_state(timer, "create")
@@ -846,93 +1293,252 @@ class TimerEngine(_Listeners):
             return self.start(timer_id)
         return self.view(timer)
 
-    def start(self, timer_id: str, artifact_id: str | None = None) -> dict:
+    def _init_tstate(self, timer: dict) -> None:
+        names = [t["id"] for t in timer["tracks"]]
+        if any(s["track"] == JOIN_TRACK for s in timer["steps"]):
+            names.append(JOIN_TRACK)
+        timer["tstate"] = {name: self._new_tstate() for name in names}
+
+    def start(self, timer_id: str, artifact_id: str | None = None, source: str | None = None) -> dict:
         timer = self._get(timer_id, artifact_id)
         if timer["state"] not in ("idle", "finished"):
             raise ArtifactError("invalid_state", f"timer is {timer['state']}; reset it first")
-        fired = 0
-        while fired < len(timer["steps"]) and timer["steps"][fired]["at"] <= EPS:
-            fired += 1  # offset-0 steps are visible on screen, not announced
-        timer.update(state="running", elapsed=0.0, started_at=self._clock(), fired=fired, finished_at=None)
+        self._init_tstate(timer)
+        for tid, ts in timer["tstate"].items():
+            if tid == JOIN_TRACK:
+                continue
+            for time_, _order, kind, _index in self._events(timer, tid):
+                if time_ > EPS or kind != "start":
+                    break
+                ts["ev"] += 1  # offset-0 steps are visible on screen, not announced
+        now = self._clock()
+        timer.update(state="running", elapsed=0.0, started_at=now, finished_at=None, started_wall=now, history=[])
+        self._log(timer, "start", now, source=source)
         self._save()
         self._arm(timer)
         self._emit_state(timer, "start")
         return self.view(timer)
 
-    def pause(self, timer_id: str, artifact_id: str | None = None) -> dict:
+    def pause(self, timer_id: str, artifact_id: str | None = None, track: str | None = None, source: str | None = None) -> dict:
         timer = self._get(timer_id, artifact_id)
-        if timer["state"] != "running":
-            raise ArtifactError("invalid_state", "timer is not running")
-        timer["elapsed"] = self._elapsed(timer, self._clock())
-        timer.update(state="paused", started_at=None)
-        self._disarm(timer_id)
-        self._save()
-        self._emit_state(timer, "pause")
-        return self.view(timer)
-
-    def resume(self, timer_id: str, artifact_id: str | None = None) -> dict:
-        timer = self._get(timer_id, artifact_id)
-        if timer["state"] != "paused":
-            raise ArtifactError("invalid_state", "timer is not paused")
-        timer.update(state="running", started_at=self._clock())
+        tid = self._track_arg(timer, track)
+        now = self._clock()
+        if tid is None:
+            if timer["state"] != "running":
+                raise ArtifactError("invalid_state", "timer is not running")
+            timer["elapsed"] = self._elapsed(timer, now)
+            timer.update(state="paused", started_at=None)
+            self._disarm(timer_id)
+            self._log(timer, "pause", now, source=source)
+            self._save()
+            self._emit_state(timer, "pause")
+            return self.view(timer)
+        if timer["state"] not in ("running", "paused"):
+            raise ArtifactError("invalid_state", "timer is not active")
+        ts = timer["tstate"][tid]
+        if ts["hold_since"] is not None:
+            raise ArtifactError("invalid_state", f"track '{tid}' is already paused")
+        ts.update(hold_since=self._elapsed(timer, now), manual=True)
+        self._log(timer, "pause", now, track=tid, source=source)
         self._save()
         self._arm(timer)
-        self._emit_state(timer, "resume")
+        self._emit_state(timer, "pause", track=tid)
         return self.view(timer)
 
-    def reset(self, timer_id: str, artifact_id: str | None = None) -> dict:
+    def resume(self, timer_id: str, artifact_id: str | None = None, track: str | None = None, source: str | None = None) -> dict:
+        timer = self._get(timer_id, artifact_id)
+        tid = self._track_arg(timer, track)
+        now = self._clock()
+        if tid is None:
+            if timer["state"] != "paused":
+                raise ArtifactError("invalid_state", "timer is not paused")
+            timer.update(state="running", started_at=now)
+            self._log(timer, "resume", now, source=source)
+            self._save()
+            self._arm(timer)
+            self._emit_state(timer, "resume")
+            return self.view(timer)
+        ts = timer["tstate"][tid]
+        if ts["waiting"] is not None:
+            raise ArtifactError("invalid_state", f"track '{tid}' is waiting for an answer")
+        if ts["hold_since"] is None:
+            raise ArtifactError("invalid_state", f"track '{tid}' is not paused")
+        self._release(ts, self._elapsed(timer, now))
+        self._log(timer, "resume", now, track=tid, source=source)
+        return self._settle(timer, now, "resume", track=tid)
+
+    def reset(self, timer_id: str, artifact_id: str | None = None, source: str | None = None) -> dict:
         timer = self._get(timer_id, artifact_id)
         self._disarm(timer_id)
-        timer.update(state="idle", elapsed=0.0, started_at=None, fired=0, finished_at=None)
+        timer.update(state="idle", elapsed=0.0, started_at=None, finished_at=None)
+        self._init_tstate(timer)
         self._save()
         self._emit_state(timer, "reset")
         return self.view(timer)
 
-    def skip(self, timer_id: str, to_index: int | None = None, artifact_id: str | None = None) -> dict:
+    def skip(
+        self,
+        timer_id: str,
+        to_index: int | None = None,
+        artifact_id: str | None = None,
+        track: str | None = None,
+        source: str | None = None,
+    ) -> dict:
         timer = self._get(timer_id, artifact_id)
         if timer["state"] not in ("running", "paused"):
             raise ArtifactError("invalid_state", "timer is not active")
         now = self._clock()
-        elapsed = self._elapsed(timer, now)
+        big_t = self._elapsed(timer, now)
         steps = timer["steps"]
-        if to_index is None:
-            index = next((i for i, s in enumerate(steps) if s["at"] > elapsed + EPS), None)
-        else:
-            if not isinstance(to_index, int) or not 0 <= to_index < len(steps):
+        tid = self._track_arg(timer, track)
+        position = None
+        if to_index is not None:
+            if not isinstance(to_index, int) or isinstance(to_index, bool) or not 0 <= to_index < len(steps):
                 raise ArtifactError("invalid", "to_index is out of range")
-            index = to_index
-        if index is None or steps[index]["at"] >= timer["duration"] - EPS:
+            tid = steps[to_index]["track"]
+            events = self._events(timer, tid)
+            position = next((i for i, e in enumerate(events) if e[3] == to_index and e[2] != "end"), None)
+        else:
+            if tid is None:  # the track with the soonest upcoming event
+                pick = self.view(timer)
+                tid = next(
+                    (v["id"] for v in [*pick["tracks"], pick["join"]] if v and v["next_index"] is not None
+                     and v["next_index"] == pick["next_index"] and v["state"] != "waiting"),
+                    None,
+                )
+                if tid is None and pick["waiting"]:
+                    tid = pick["waiting"][0]["track"]
+            if tid is not None:
+                events = self._events(timer, tid)
+                ev = timer["tstate"][tid]["ev"]
+                position = ev if ev < len(events) else None
+                if timer["tstate"][tid]["waiting"] is not None:
+                    position = ev  # skipping a gate answers it
+        if tid is None or position is None:
+            if track is not None and len(timer["tstate"]) > 1:
+                return self.view(timer)  # that lane has nothing left to skip
+            self._log(timer, "skip", now, source=source)
             self._finish(timer, now)
             return self.view(timer)
-        timer["elapsed"] = steps[index]["at"]
-        if timer["state"] == "running":
-            timer["started_at"] = now
-        timer["fired"] = index + 1
-        self._save()
-        self._arm(timer)
-        self._emit_state(timer, "skip")
-        return self.view(timer)
+        ts = timer["tstate"][tid]
+        events = self._events(timer, tid)
+        time_, _o, kind, index = events[position]
+        step = steps[index]
+        if tid != JOIN_TRACK and kind == "start" and not step.get("duration") and not step.get("gate") and step["at"] >= timer["duration"] - EPS:
+            self._log(timer, "skip", now, track=tid if timer.get("multi") else None, index=index, source=source)
+            self._finish(timer, now, index)
+            return self.view(timer)
+        if ts["hold_since"] is not None:
+            if ts["waiting"] is not None:
+                self._release(ts, big_t)
+                ts["held"] = big_t - time_
+            else:
+                ts["held"] = ts["hold_since"] - time_
+        else:
+            ts["held"] = big_t - time_
+        ts["waiting"], ts["auto_at"] = None, None
+        ts["ev"] = position + 1
+        self._log(timer, "skip", now, track=tid if timer.get("multi") else None, index=index, source=source)
+        return self._settle(timer, now, "skip", track=tid if timer.get("multi") else None)
 
-    def extend(self, timer_id: str, seconds: float, artifact_id: str | None = None) -> dict:
-        """Push every remaining step (and the end) later (or earlier) by ``seconds``."""
+    def _shift_track(self, timer: dict, tid: str, seconds: float) -> None:
+        ts = timer["tstate"][tid]
+        el = self._tel(timer, tid, self._elapsed(timer, self._clock()))
+        for step in timer["steps"]:
+            if step["track"] != tid:
+                continue
+            if step["at"] > el + EPS:
+                step["at"] = max(el + 1.0, step["at"] + seconds)
+            elif step.get("duration") and not step.get("gate") and step["at"] + step["duration"] > el + EPS:
+                step["duration"] = max(el + 1.0 - step["at"], step["duration"] + seconds)
+        for regate in ts["regates"]:
+            if regate["at"] > el + EPS:
+                regate["at"] = max(el + 1.0, regate["at"] + seconds)
+        ts["offset"] += seconds
+
+    def extend(
+        self,
+        timer_id: str,
+        seconds: float,
+        artifact_id: str | None = None,
+        track: str | None = None,
+        source: str | None = None,
+    ) -> dict:
+        """Push the remaining steps (and the end) later (or earlier) by ``seconds``.
+
+        With ``track`` only that lane moves; without it, every lane does.
+        """
         timer = self._get(timer_id, artifact_id)
         if timer["state"] not in ("running", "paused"):
             raise ArtifactError("invalid_state", "timer is not active")
+        tid = self._track_arg(timer, track)
         try:
             seconds = float(seconds)
         except (TypeError, ValueError) as err:
             raise ArtifactError("invalid", "seconds must be a number") from err
         if seconds == 0 or abs(seconds) > 3600:
             raise ArtifactError("invalid", "seconds must be non-zero and within one hour")
-        elapsed = self._elapsed(timer, self._clock())
-        for step in timer["steps"]:
-            if step["at"] > elapsed + EPS:
-                step["at"] = max(elapsed + 1.0, step["at"] + seconds)
-        timer["duration"] = max(elapsed + 1.0, timer["duration"] + seconds)
+        now = self._clock()
+        big_t = self._elapsed(timer, now)
+        targets = [tid] if tid else list(timer["tstate"])
+        for name in targets:
+            self._shift_track(timer, name, seconds)
+        self._fix_duration(timer, None if tid else seconds, big_t)
+        self._log(timer, "extend", now, seconds=seconds, track=tid, index=self._focus(timer, tid), source=source)
         self._save()
         self._arm(timer)
-        self._emit_state(timer, "extend")
+        self._emit_state(timer, "extend", track=tid)
         return self.view(timer)
+
+    def _focus(self, timer: dict, tid: str | None) -> int | None:
+        view = self.view(timer)
+        if tid:
+            return next((t["current_index"] for t in view["tracks"] if t["id"] == tid), None)
+        return view["current_index"] if view["current_index"] >= 0 else None
+
+    def answer(
+        self,
+        timer_id: str,
+        index: int,
+        answer: Any,
+        artifact_id: str | None = None,
+        source: str | None = None,
+    ) -> dict:
+        """Answer a check gate: "yes" (done) or a number of seconds to cook longer."""
+        timer = self._get(timer_id, artifact_id)
+        if timer["state"] not in ("running", "paused"):
+            raise ArtifactError("invalid_state", "timer is not active")
+        tid = next((t for t, ts in timer["tstate"].items() if ts["waiting"] is not None and ts["waiting"] == index), None)
+        if tid is None:
+            raise ArtifactError("invalid_state", f"step {index} is not waiting for an answer")
+        seconds = None
+        if not (answer is True or (isinstance(answer, str) and answer.strip().lower() in YES_WORDS)):
+            try:
+                seconds = float(answer)
+            except (TypeError, ValueError) as err:
+                raise ArtifactError("invalid", 'answer must be "yes" or a number of seconds') from err
+            if not 0 < seconds <= 3600:
+                raise ArtifactError("invalid", "extra time must be between 1 second and one hour")
+        now = self._clock()
+        big_t = self._elapsed(timer, now)
+        ts = timer["tstate"][tid]
+        el = self._tel(timer, tid, big_t)
+        self._release(ts, big_t)
+        if seconds:
+            # Push the rest of this lane back and ask again when the extra time is up.
+            for step in timer["steps"]:
+                if step["track"] == tid and step["at"] > el + EPS:
+                    step["at"] += seconds
+            for regate in ts["regates"]:
+                if regate["at"] > el + EPS:
+                    regate["at"] += seconds
+            if len(ts["regates"]) >= MAX_REGATES:
+                raise ArtifactError("limit", "this check has been repeated too many times")
+            ts["regates"].append({"index": index, "at": el + seconds})
+            ts["offset"] += seconds
+            self._fix_duration(timer)
+        self._log(timer, "answer", now, track=tid, index=index, answer="yes" if seconds is None else seconds, source=source)
+        return self._settle(timer, now, "answer", track=tid, index=index)
 
     def delete(self, timer_id: str, artifact_id: str | None = None) -> None:
         timer = self._get(timer_id, artifact_id)
@@ -960,19 +1566,26 @@ class TimerEngine(_Listeners):
         artifact_id: str | None = None,
         to_index: int | None = None,
         seconds: float | None = None,
+        track: str | None = None,
+        answer: Any = None,
+        source: str | None = None,
     ) -> dict | None:
         if action == "start":
-            return self.start(timer_id, artifact_id)
+            return self.start(timer_id, artifact_id, source)
         if action == "pause":
-            return self.pause(timer_id, artifact_id)
+            return self.pause(timer_id, artifact_id, track, source)
         if action == "resume":
-            return self.resume(timer_id, artifact_id)
+            return self.resume(timer_id, artifact_id, track, source)
         if action == "reset":
-            return self.reset(timer_id, artifact_id)
+            return self.reset(timer_id, artifact_id, source)
         if action == "skip":
-            return self.skip(timer_id, to_index, artifact_id)
+            return self.skip(timer_id, to_index, artifact_id, track, source)
         if action == "extend":
-            return self.extend(timer_id, 60 if seconds is None else seconds, artifact_id)
+            return self.extend(timer_id, 60 if seconds is None else seconds, artifact_id, track, source)
+        if action == "answer":
+            if not isinstance(to_index, int) or isinstance(to_index, bool):
+                raise ArtifactError("invalid", "answer needs the step index (to_index)")
+            return self.answer(timer_id, to_index, "yes" if answer is None else answer, artifact_id, source)
         if action == "delete":
             self.delete(timer_id, artifact_id)
             return None

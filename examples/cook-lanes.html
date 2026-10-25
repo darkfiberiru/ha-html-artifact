@@ -1,0 +1,165 @@
+<!doctype html>
+<!--
+  Example 3: PARALLEL LANES. One timer, two tracks (rice and fish) that run side by side.
+  Each lane has its own countdown, +1 min, Next and Pause. "Check the fish" is a GATE: the
+  fish lane waits for you to answer (Done / +1 min / +2 min) on this page or on your phone,
+  while the rice keeps going. "Serve" is a join step that fires when both lanes are finished.
+  Publish with capabilities {"notify": true} for phone alerts.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Tikka Masala Tilapia</title>
+<style>
+  :root { --bg:#f4f6f3; --card:#fff; --fg:#1b2420; --muted:#5a6862; --line:#dbe2dd; --accent:#2c6a4c; --soft:#e2efe7; --warm:#a8690c; }
+  :root[data-theme="dark"] { --bg:#111614; --card:#1a211e; --fg:#e6ece8; --muted:#9aaaa2; --line:#2c3632; --accent:#84c7a3; --soft:#1f3329; --warm:#e5b252; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:16px; background:var(--bg); color:var(--fg); font:17px/1.5 system-ui,-apple-system,sans-serif; }
+  .wrap { max-width: 880px; margin: 0 auto; display: grid; gap: 14px; }
+  h1 { margin: 0; font-size: clamp(26px, 6vw, 38px); line-height: 1.1; }
+  .sub { color: var(--muted); margin: 4px 0 0; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 18px; }
+  .now { display: grid; gap: 6px; }
+  .tag { font-size: 12px; letter-spacing: .12em; text-transform: uppercase; color: var(--accent); font-weight: 700; }
+  .step-name { font-size: clamp(24px, 6vw, 34px); font-weight: 800; line-height: 1.15; }
+  .detail { color: var(--muted); }
+  .count { font-variant-numeric: tabular-nums; font-size: clamp(44px, 14vw, 84px); font-weight: 800; line-height: 1; color: var(--warm); }
+  .count small { font-size: 16px; font-weight: 600; color: var(--muted); display: block; letter-spacing: 0; }
+  .bar { height: 8px; border-radius: 999px; background: var(--line); overflow: hidden; }
+  .bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .25s linear; }
+  .btns { display: flex; flex-wrap: wrap; gap: 10px; }
+  button { font: inherit; font-weight: 700; border-radius: 12px; border: 1.5px solid var(--line); background: var(--card); color: var(--fg); padding: 12px 18px; min-height: 48px; cursor: pointer; }
+  button.main { background: var(--accent); border-color: var(--accent); color: var(--bg); flex: 1 1 180px; }
+  button:disabled { opacity: .45; cursor: default; }
+  ol { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
+  ol li { display: grid; grid-template-columns: 56px 1fr; gap: 12px; padding: 8px 10px; border-radius: 10px; }
+  ol li .m { font-variant-numeric: tabular-nums; font-weight: 700; color: var(--muted); }
+  ol li.done { opacity: .5; text-decoration: line-through; }
+  ol li.cur { background: var(--soft); outline: 2px solid var(--accent); }
+  ol li b { display: block; }
+  ol li span.d { color: var(--muted); font-size: 15px; }
+  .ing { display: grid; gap: 2px; }
+  .ing label { display: flex; gap: 10px; padding: 8px 0; border-bottom: 1px dashed var(--line); cursor: pointer; }
+  .ing input { width: 20px; height: 20px; accent-color: var(--accent); }
+  .ing input:checked + span { color: var(--muted); text-decoration: line-through; }
+  .muted { color: var(--muted); font-size: 14px; }
+  .lanes { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+  .lane.waiting { outline: 3px solid var(--warm); }
+  .lane h2 { margin: 0 0 6px; font-size: 20px; }
+  .lane .step-name { font-size: 24px; }
+  .lane .count { font-size: clamp(36px, 10vw, 56px); }
+  .gate { background: var(--soft); border-radius: 12px; padding: 12px; display: grid; gap: 8px; }
+  .gate b { font-size: 18px; }
+  .small button { min-height: 40px; padding: 8px 12px; font-size: 15px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Tikka Masala Tilapia</h1>
+    <p class="sub">From frozen, with rice. About 27 minutes. Rice and fish run in parallel.</p>
+  </header>
+
+  <section class="card">
+    <span class="tag" id="state">Ready</span>
+    <div class="step-name" id="headline">Press Start when the rice goes on</div>
+    <div class="btns" style="margin-top:10px">
+      <button class="main" id="go">Start</button>
+      <button id="reset" disabled>Reset</button>
+    </div>
+    <div class="muted" id="note"></div>
+  </section>
+
+  <div class="lanes" id="lanes"></div>
+</div>
+
+<script>
+const MIN = 60;
+const RECIPE = {
+  label: "Tikka Masala Tilapia (frozen)",
+  tracks: [{ id: "rice", label: "Rice" }, { id: "fish", label: "Fish" }],
+  steps: [
+    { track: "rice", at: 0, label: "Start the rice", detail: "Cooker on Cook.", duration: 16 * MIN },
+    { track: "rice", at: 16 * MIN, label: "Steaming", detail: "Flip to Warm. Keep the lid shut.", duration: 10 * MIN, endLabel: "Rice ready" },
+    { track: "fish", at: 7 * MIN, label: "Heat the sauce", detail: "Tikka masala sauce in the skillet.", duration: 3 * MIN },
+    { track: "fish", at: 10 * MIN, label: "Simmer the frozen fish", detail: "Covered, medium-low.", duration: 8 * MIN },
+    { track: "fish", at: 18 * MIN, label: "Spoon sauce over", detail: "Then cover again.", duration: 7 * MIN },
+    { track: "fish", at: 25 * MIN, label: "Check the fish", gate: { question: "Flakes all the way through, 145F?", yes: "Done", more: [60, 120] } },
+    { track: "*", label: "Serve", detail: "Plate the rice, fish on top, sauce over." },
+  ],
+};
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+const fmt = (s) => { s = Math.max(0, Math.ceil(s)); return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0"); };
+let timer = null;
+
+function laneHtml(l) {
+  const cur = l.current;
+  const left = l.remaining != null ? l.remaining : l.nextIn;
+  const label = l.waiting ? "waiting for you" : l.remaining != null ? "left" : l.next ? "until: " + l.next.label : "";
+  const stateTag = { idle: "Ready", running: "Cooking", paused: "Paused", waiting: "Check", done: "Done", finished: "Done" }[l.state] || l.state;
+  const gate = l.waiting && l.gate
+    ? `<div class="gate"><b>${esc(l.gate.question)}</b><div class="btns small">
+         <button class="main" data-answer="yes" data-i="${l.currentIndex}">${esc(l.gate.yes)}</button>
+         ${l.gate.more.map((n) => `<button data-answer="${n}" data-i="${l.currentIndex}">+${n >= 60 ? n / 60 + " min" : n + " s"}</button>`).join("")}
+       </div></div>` : "";
+  return `<section class="card lane now ${l.waiting ? "waiting" : ""}" data-track="${l.id}">
+    <span class="tag">${esc(l.label)} · ${stateTag}</span>
+    <div class="step-name">${cur ? esc(cur.label) : "Not started"}</div>
+    <div class="detail">${cur && cur.detail ? esc(cur.detail) : ""}</div>
+    ${l.state === "done" || l.state === "finished" || l.waiting || left == null ? "" : `<div class="count">${fmt(left)}<small>${esc(label)}</small></div>`}
+    ${gate}
+    ${l.state === "running" || l.state === "paused" ? `<div class="btns small">
+      <button data-act="plus">+1 min</button><button data-act="next">Next</button>
+      <button data-act="${l.state === "paused" ? "resume" : "pause"}">${l.state === "paused" ? "Resume" : "Pause"}</button></div>` : ""}
+  </section>`;
+}
+
+function render() {
+  const v = timer ? ha.timers.view(timer) : null;
+  const state = v ? v.state : "idle";
+  $("state").textContent = { idle: "Ready", running: "Cooking", paused: "Paused", finished: "Done" }[state];
+  $("go").textContent = { idle: "Start", running: "Pause all", paused: "Resume all", finished: "Cook again" }[state];
+  $("reset").disabled = !v || state === "idle";
+  $("headline").textContent = !v || state === "idle" ? "Press Start when the rice goes on"
+    : state === "finished" ? "Dinner is ready"
+    : v.waiting.length ? "Waiting for your answer" : v.current ? v.current.label : "Getting started";
+  const lanes = v ? v.tracks : RECIPE.tracks.map((t) => ({ id: t.id, label: t.label, state: "idle", nextIn: null, remaining: null, waiting: false, current: null, next: null }));
+  const html = lanes.map(laneHtml).join("");
+  if ($("lanes").dataset.html !== html) { $("lanes").innerHTML = html; $("lanes").dataset.html = html; }
+}
+
+async function go() {
+  if (!timer) timer = await ha.timers.create({ label: RECIPE.label, tracks: RECIPE.tracks, steps: RECIPE.steps, start: true });
+  else if (timer.state === "running") await ha.timers.pause(timer.id);
+  else if (timer.state === "paused") await ha.timers.resume(timer.id);
+  else { await ha.timers.reset(timer.id); await ha.timers.start(timer.id); }
+}
+
+(async () => {
+  await ha.ready;
+  $("note").textContent = ha.grants && ha.grants.notify
+    ? "Each lane alerts your phone by name, and the fish check has Done / +1 min / +2 min buttons."
+    : "Ask the household admin to approve notifications for this page to get phone alerts.";
+  ha.timers.subscribe((list) => { timer = list[0] || null; render(); });
+  ha.timers.onFired(() => navigator.vibrate && navigator.vibrate([200, 100, 200]));
+  setInterval(render, 250);
+  $("go").onclick = go;
+  $("reset").onclick = () => ha.timers.reset(timer.id);
+  $("lanes").onclick = (e) => {
+    const b = e.target.closest("button");
+    if (!b || !timer) return;
+    const track = b.closest("[data-track]").dataset.track;
+    if (b.dataset.answer) ha.timers.answer(timer.id, Number(b.dataset.i), b.dataset.answer === "yes" ? "yes" : Number(b.dataset.answer));
+    else if (b.dataset.act === "plus") ha.timers.extend(timer.id, 60, { track });
+    else if (b.dataset.act === "next") ha.timers.skip(timer.id, { track });
+    else if (b.dataset.act === "pause") ha.timers.pause(timer.id, { track });
+    else if (b.dataset.act === "resume") ha.timers.resume(timer.id, { track });
+  };
+  try { await navigator.wakeLock.request("screen"); } catch (e) { /* optional */ }
+})();
+</script>
+</body>
+</html>

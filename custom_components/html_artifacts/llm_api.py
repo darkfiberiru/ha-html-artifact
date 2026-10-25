@@ -73,23 +73,50 @@ window.ha API (all methods return promises unless noted)
       A step at 0 is shown but not announced. With the `notify` capability granted
       the user's phone gets an alert per step, a live countdown notification and
       Pause / +1 min / Next buttons.
-  ha.timers.fromDurations([{label, seconds, detail?}])  (sync) -> {steps, duration}
-  ha.timers.list(), start(id), pause(id), resume(id), reset(id),
-      skip(id[, toIndex]), extend(id, seconds), remove(id)
+  Parallel lanes (tracks): ha.timers.create({label, tracks: [{id:"rice", label:"Rice"},
+      {id:"fish", label:"Fish"}], steps: [{track:"rice", at, label}, ...]}). Each lane has
+      its own offset, so extending the fish never moves the rice. Steps without `track`
+      share one implicit lane (old pages are unaffected). A join step -
+      {track:"*", label:"Serve"} or {after:["rice","fish"], label} - fires once every
+      listed lane is finished (omit `at`; it sorts last). duration defaults to the longest lane.
+  Step activities: {at, label, duration: 960, endLabel?: "Simmer done"}. While inside it the
+      countdown is the time LEFT in the activity (view.current.remaining; the phone shows
+      "Simmer 9:40"), and endLabel alerts when it ends.
+  Check gates ("cook until done"): {track, at, label, gate: {question: "145F?", yes?: "Done",
+      more?: [60,120], autoYesAfter?: 600}}. The lane pauses and the step stays current
+      (view.current.waiting) until ha.timers.answer(id, stepIndex, "yes" | seconds). The phone
+      shows the question with Done / +1 min / +2 min; +N pushes the lane back and asks again.
+  ha.timers.fromDurations([{label, seconds, detail?, track?}])  (sync) -> {steps, duration}
+      (emits `duration` on each step, so the countdown shows time left in each step)
+  ha.timers.list(), start(id), pause(id[, {track}]), resume(id[, {track}]), reset(id),
+      skip(id[, toIndex | {track}]), extend(id, seconds[, {track}]), answer(id, stepIndex, yesOrSeconds),
+      remove(id).  Without {track}, pause/skip/extend act on every lane (skip: the lane
+      whose step is next).
   ha.timers.subscribe(cb)                   cb(timersForThisArtifact) now and on change
   ha.timers.view(t) (sync)                  adds live fields from a timer t:
-      elapsed, remaining, current, currentIndex, next, nextIndex, nextIn
+      elapsed, remaining, current, currentIndex, next, nextIndex, nextIn (the soonest event
+      across lanes) and tracks: [{id, label, state, current, next, nextIn, remaining, offset,
+      waiting, gate}] where state is running|paused|waiting|done. current.remaining and
+      current.waiting are set when the step is an activity / an unanswered gate. waiting lists
+      unanswered gates.
       Call it every ~250ms from a render loop to animate a countdown; it uses the
       time since the timer was received, so device clocks do not matter.
-  ha.timers.onFired(cb)                     cb({kind: "step"|"finished", timer, step})
+  ha.timers.onFired(cb)                     cb({kind: "step"|"gate"|"finished", phase, track, timer, step})
   ha.entities.get(entityIdOrArray)          needs `entities` grant
   ha.entities.subscribe(ids, cb)            cb(state, entityId) now and on change
   ha.callService(domain, service, data, target)   needs `services` grant
   ha.notify(message, title)                 needs `notify` grant
 
 Timer states: idle, running, paused, finished.
-Events on the HA bus: html_artifacts_timer_step, html_artifacts_timer_finished
-(usable in automations).
+Events on the HA bus: html_artifacts_timer_step (has track and phase start|end),
+html_artifacts_timer_gate (question, options), html_artifacts_timer_finished (has history,
+planned, started, finished) - usable in automations.
+timer.history lists every start/pause/resume/extend/skip/answer with time, track, step index
+and source (page|notification|mcp|auto); finished timers are kept for 7 days, so a page that
+was closed during the cook can still record how the run went (planned_duration vs actual).
+Phone: one ongoing notification per timer lists every active lane ("Fish: Simmer 9:40 ·
+Rice: Steaming 3:10"); alerts are named ("Rice — Rice ready"); +1 min / Next / Pause act on
+the lane that just fired. Use artifact_timer_create to start such a timer from chat.
 """
 
 SHORT_PROMPT = (
@@ -144,16 +171,23 @@ class ReadTool(_Tool):
     name = "artifact_read"
     description = (
         "Read an artifact's html and version. Always do this before changing a page: the "
-        "user may have edited it by hand. With metadata_only=true you get only the version, "
-        "size, title and capabilities (no html), which is enough to pass as base_version."
+        "user may have edited it by hand. With include_html=false (or metadata_only=true) you get "
+        "only the version, size, title and capabilities (no html), which is enough to pass as "
+        "base_version."
     )
-    parameters = vol.Schema({vol.Required("artifact_id"): str, vol.Optional("metadata_only"): bool})
+    parameters = vol.Schema(
+        {
+            vol.Required("artifact_id"): str,
+            vol.Optional("metadata_only"): bool,
+            vol.Optional("include_html"): bool,
+        }
+    )
 
     @_guard
     async def async_call(self, hass, tool_input, llm_context) -> JsonObjectType:
         args = tool_input.tool_args
         artifact = _rt(hass).artifacts.get(args["artifact_id"])
-        if args.get("metadata_only"):
+        if args.get("metadata_only") or args.get("include_html") is False:
             artifact.pop("html", None)
         return artifact
 
@@ -203,7 +237,7 @@ class PatchTool(_Tool):
     name = "artifact_patch"
     description = (
         "Change an existing artifact with find/replace edits instead of resending the whole page. "
-        "edits = [{old_str, new_str}] applied in order; each old_str must appear EXACTLY once in "
+        "edits = [{old_str, new_str}] (old/new also work) applied in order; each old_str must appear EXACTLY once in "
         "the page (add surrounding text to make it unique); all edits apply or none do. "
         "base_version is required: the version you read (artifact_read, metadata_only is fine). "
         "A stale version returns a 'conflict' with the current html. Returns the new version, "
@@ -214,7 +248,14 @@ class PatchTool(_Tool):
             vol.Required("artifact_id"): str,
             vol.Required("base_version"): int,
             vol.Required("edits"): [
-                vol.Schema({vol.Required("old_str"): str, vol.Required("new_str"): str})
+                vol.Schema(
+                    {
+                        vol.Optional("old_str"): str,
+                        vol.Optional("new_str"): str,
+                        vol.Optional("old"): str,
+                        vol.Optional("new"): str,
+                    }
+                )
             ],
             vol.Optional("title"): str,
             vol.Optional("description"): str,
@@ -226,9 +267,16 @@ class PatchTool(_Tool):
     async def async_call(self, hass, tool_input, llm_context) -> JsonObjectType:
         args = tool_input.tool_args
         store = _rt(hass).artifacts
+        edits = []
+        for edit in args["edits"]:
+            old = edit.get("old_str", edit.get("old"))
+            new = edit.get("new_str", edit.get("new"))
+            if old is None or new is None:
+                raise ArtifactError("invalid", "each edit needs old_str and new_str (or old and new)")
+            edits.append({"old_str": old, "new_str": new})
         result = store.patch(
             args["artifact_id"],
-            args["edits"],
+            edits,
             base_version=args["base_version"],
             title=args.get("title"),
             description=args.get("description"),
@@ -313,8 +361,13 @@ class CheckTool(_Tool):
 
 class KvGetTool(_Tool):
     name = "artifact_kv_get"
-    description = "Read an artifact's shared state (one key, or all keys if key is omitted)."
-    parameters = vol.Schema({vol.Required("artifact_id"): str, vol.Optional("key"): str})
+    description = (
+        "Read an artifact's shared state: one key, or all keys if key is omitted. "
+        "prefix limits the 'all keys' result to keys starting with it (e.g. 'checked-pesto-')."
+    )
+    parameters = vol.Schema(
+        {vol.Required("artifact_id"): str, vol.Optional("key"): str, vol.Optional("prefix"): str}
+    )
 
     @_guard
     async def async_call(self, hass, tool_input, llm_context) -> JsonObjectType:
@@ -322,7 +375,10 @@ class KvGetTool(_Tool):
         store = _rt(hass).artifacts
         if "key" in args:
             return {"value": store.kv_get(args["artifact_id"], args["key"])}
-        return {"values": store.kv_all(args["artifact_id"])}
+        values = store.kv_all(args["artifact_id"])
+        if args.get("prefix"):
+            values = {k: v for k, v in values.items() if k.startswith(args["prefix"])}
+        return {"values": values}
 
 
 class KvSetTool(_Tool):
@@ -353,14 +409,20 @@ class TimerCreateTool(_Tool):
     name = "artifact_timer_create"
     description = (
         "Create a server-side timer for an artifact. steps = [{at: seconds since start, "
-        "label, detail?, notify?}], duration = total seconds. Phone notifications need "
-        "the artifact's 'notify' capability to be approved."
+        "label, detail?, notify?, track?, duration?, endLabel?, gate?, after?}], duration = total "
+        "seconds (default: the longest lane). tracks = [{id, label}] makes parallel lanes "
+        "(rice / fish): give steps a track id; track '*' (or after:[ids]) is a join step that "
+        "fires when those lanes are finished. A step duration makes it an activity "
+        "('Simmer, 9:40 left'; endLabel announces its end). gate = {question, yes?, more?: "
+        "[60,120], autoYesAfter?} pauses that lane until the phone/page answers (cook until "
+        "done). Phone notifications need the artifact's 'notify' capability to be approved."
     )
     parameters = vol.Schema(
         {
             vol.Required("artifact_id"): str,
             vol.Required("label"): str,
             vol.Optional("steps"): [dict],
+            vol.Optional("tracks"): [vol.Any(dict, str)],
             vol.Optional("duration"): vol.Coerce(float),
             vol.Optional("start"): bool,
         }
@@ -374,26 +436,38 @@ class TimerCreateTool(_Tool):
             raise ArtifactError("not_found", f"artifact '{args['artifact_id']}' does not exist")
         timer = rt.timers.create(
             args["artifact_id"], args["label"], args.get("steps"), args.get("duration"),
-            None, bool(args.get("start")),
+            None, bool(args.get("start")), tracks=args.get("tracks"),
         )
         return {"timer": timer}
 
 
 class TimerControlTool(_Tool):
     name = "artifact_timer_control"
-    description = "Control a timer: start, pause, resume, reset, skip, extend (seconds) or delete."
+    description = (
+        "Control a timer: start, pause, resume, reset, skip, extend (seconds), answer or delete. "
+        "track limits pause/resume/skip/extend to one lane. answer needs step_index (the gate "
+        "step) and answer = 'yes' or extra seconds."
+    )
     parameters = vol.Schema(
         {
             vol.Required("timer_id"): str,
-            vol.Required("action"): vol.In(["start", "pause", "resume", "reset", "skip", "extend", "delete"]),
+            vol.Required("action"): vol.In(
+                ["start", "pause", "resume", "reset", "skip", "extend", "answer", "delete"]
+            ),
             vol.Optional("seconds"): vol.Coerce(float),
+            vol.Optional("track"): str,
+            vol.Optional("step_index"): int,
+            vol.Optional("answer"): vol.Any(str, int, float, bool),
         }
     )
 
     @_guard
     async def async_call(self, hass, tool_input, llm_context) -> JsonObjectType:
         args = tool_input.tool_args
-        timer = _rt(hass).timers.control(args["timer_id"], args["action"], seconds=args.get("seconds"))
+        timer = _rt(hass).timers.control(
+            args["timer_id"], args["action"], seconds=args.get("seconds"), track=args.get("track"),
+            to_index=args.get("step_index"), answer=args.get("answer"), source="mcp",
+        )
         return {"timer": timer}
 
 

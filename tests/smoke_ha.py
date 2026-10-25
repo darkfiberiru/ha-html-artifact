@@ -83,6 +83,7 @@ async def main():
     bus_events = []
     hass.bus.async_listen(EVENT_STEP, lambda e: bus_events.append(("step", dict(e.data))))
     hass.bus.async_listen(EVENT_FINISHED, lambda e: bus_events.append(("finished", dict(e.data))))
+    hass.bus.async_listen("html_artifacts_timer_gate", lambda e: bus_events.append(("gate", dict(e.data))))
 
     # --- websocket handlers -----------------------------------------------------------
     async_register_websocket(hass)
@@ -173,6 +174,44 @@ async def main():
     r = await ws("timers/list", artifact_id="pesto")
     assert [t["state"] for t in r["result"]["timers"]].count("finished") == 2
     ok("finished timers persist for any device to read")
+
+    # --- tracks and gates on the phone -----------------------------------------------------
+    from custom_components.html_artifacts import handle_notification_action  # noqa: E402
+
+    sent.clear()
+    bus_events.clear()
+    lane_steps = [
+        {"track": "rice", "at": 0, "label": "Start the rice"},
+        {"track": "rice", "at": 0.4, "label": "Rice ready"},
+        {"track": "fish", "at": 1.0, "label": "Check the fish", "gate": {"question": "145F?", "more": [60, 120]}},
+        {"track": "*", "label": "Serve"},
+    ]
+    r = await ws("timers/create", artifact_id="pesto", label="Tikka", steps=lane_steps,
+                 tracks=[{"id": "rice", "label": "Rice"}, {"id": "fish", "label": "Fish"}], start=True)
+    assert r["success"], r
+    lane_id = r["result"]["timer"]["id"]
+    await asyncio.sleep(1.5)
+    alerts = [s for s in sent if s["data"].get("tag", "").endswith("_alert")]
+    assert any(a["message"] == "Rice — Rice ready" for a in alerts), [a["message"] for a in alerts]
+    gate_msgs = [s for s in sent if "_gate_" in s["data"].get("tag", "") and s["message"] != "clear_notification"]
+    assert gate_msgs and "145F?" in gate_msgs[0]["message"], sent
+    titles = [a["title"] for a in gate_msgs[0]["data"]["actions"]]
+    assert titles == ["Done", "+1 min", "+2 min"], titles
+    live = [s for s in sent if s["data"].get("tag") == f"htmlart_{lane_id}" and s["message"] != "clear_notification"]
+    assert live and "Fish: Check the fish?" in live[-1]["message"], [s["message"] for s in live]
+    assert ("gate", "fish") in [(k, d.get("track")) for k, d in bus_events], bus_events
+    assert any(k == "step" and d.get("track") == "rice" for k, d in bus_events), bus_events
+    ok("tracks: lane-named alerts, one live notification with every lane, gate question with Done / +1 / +2 buttons")
+
+    sent.clear()
+    index = gate_msgs[0]["data"]["actions"][0]["action"].split("|")[4].split(":")[0]
+    assert handle_notification_action(timers, gate_msgs[0]["data"]["actions"][1]["action"].replace("|60", "|60"))
+    await asyncio.sleep(0.05)
+    view = timers.get_view(lane_id)
+    assert view["tracks"][1]["state"] == "running" and view["tracks"][1]["offset"] == 60, view["tracks"][1]
+    assert any(s["message"] == "clear_notification" and "_gate_" in s["data"]["tag"] for s in sent), sent
+    ok("tapping +1 min on the gate extends that lane and clears the question")
+    timers.control(lane_id, "delete")
 
     # timers cannot be driven through another artifact
     await ws("save", artifact_id="other", html="x")
@@ -266,6 +305,26 @@ async def main():
     res = await tool("artifact_timer_list", artifact_id="cook")
     assert len(res["timers"]) == 1
     ok("LLM kv and timer tools")
+
+    await tool("artifact_kv_set", artifact_id="cook", key="checked-pesto-1", value=True)
+    await tool("artifact_kv_set", artifact_id="cook", key="checked-tikka-1", value=True)
+    res = await tool("artifact_kv_get", artifact_id="cook", prefix="checked-pesto-")
+    assert list(res["values"]) == ["checked-pesto-1"], res
+    res = await tool("artifact_read", artifact_id="cook", include_html=False)
+    assert "html" not in res and res["version"] == 5, res
+    res = await tool("artifact_patch", artifact_id="cook", base_version=5, edits=[{"old": "<p>patched</p>", "new": "<p class=x>patched</p>"}])
+    assert res["version"] == 6 and "html" not in res, res
+    res = await tool(
+        "artifact_timer_create", artifact_id="cook", label="Tikka", start=True,
+        tracks=[{"id": "rice", "label": "Rice"}, {"id": "fish", "label": "Fish"}],
+        steps=[{"track": "rice", "at": 0, "label": "Start", "duration": 600},
+               {"track": "fish", "at": 300, "label": "Check", "gate": {"question": "Done?"}},
+               {"track": "*", "label": "Serve"}],
+    )
+    assert [t["id"] for t in res["timer"]["tracks"]] == ["rice", "fish"], res
+    res = await tool("artifact_timer_control", timer_id=res["timer"]["id"], action="extend", seconds=60, track="fish")
+    assert res["timer"]["tracks"][1]["offset"] == 60, res["timer"]["tracks"]
+    ok("MCP: kv prefix, include_html=false, old/new patch aliases, timers with tracks and per-lane control")
 
     # --- REST views ----------------------------------------------------------------------
     class Req(dict):

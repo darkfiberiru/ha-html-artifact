@@ -160,6 +160,65 @@ const ok = async (name, fn) => { await fn(); passed++; console.log("  ok  " + na
     page.close();
   });
 
+  // ---------------------------------------------------------------- cook lanes
+  await ok("cook-lanes: two lanes, per-lane buttons, gate answers", async () => {
+    const fx = JSON.parse(fs.readFileSync(path.join(__dirname, "fixtures", "lanes.json"), "utf8"));
+    const page = mount("cook-lanes.html", (m) => {
+      switch (m.method) {
+        case "hello": return { user: { name: "Alex" }, artifact: { id: "cook" }, grants: { notify: true }, timers: [], theme: null };
+        case "timer.create": return fx.at_5min;
+        case "timer.control": return m.params.action === "answer" ? fx.at_gate : fx.at_5min;
+        default: throw new Error("unexpected " + m.method);
+      }
+    });
+    await sleep(50);
+    assert.strictEqual(page.doc.querySelectorAll(".lane").length, 2, "both lanes show before starting");
+    page.click(page.$("go"));
+    await sleep(80);
+    const create = page.sent.find((m) => m.method === "timer.create");
+    assert.strictEqual(create.params.tracks.length, 2);
+    assert.strictEqual(create.params.steps.length, 7);
+    assert.strictEqual(create.params.steps[6].track, "*");
+    const rice = page.doc.querySelector('[data-track="rice"]');
+    const fish = page.doc.querySelector('[data-track="fish"]');
+    assert(rice.textContent.includes("Start the rice"), rice.textContent);
+    assert(/1[01]:\d\d/.test(rice.querySelector(".count").textContent), "rice shows time left in the activity: " + rice.querySelector(".count").textContent);
+    assert(rice.querySelector(".count small").textContent.includes("left"));
+    assert(fish.textContent.includes("Not started"), "fish has not begun");
+    assert(fish.querySelector(".count small").textContent.includes("Heat the sauce"));
+
+    page.click(rice.querySelector('[data-act="plus"]'));
+    await sleep(60);
+    let ctl = page.sent.filter((m) => m.method === "timer.control").pop().params;
+    assert.deepStrictEqual([ctl.action, ctl.seconds, ctl.track], ["extend", 60, "rice"]);
+    page.click(page.doc.querySelector('[data-track="fish"] [data-act="pause"]'));
+    await sleep(60);
+    ctl = page.sent.filter((m) => m.method === "timer.control").pop().params;
+    assert.deepStrictEqual([ctl.action, ctl.track], ["pause", "fish"]);
+
+    // the fish check fires on the server: the lane shows the question
+    page.send({ event: { type: "timer", change: "gate", timer: fx.at_gate } });
+    await sleep(300);
+    const gate = page.doc.querySelector('[data-track="fish"] .gate');
+    assert(gate && gate.textContent.includes("145F"), "gate question is shown");
+    assert.strictEqual(gate.querySelectorAll("button").length, 3);
+    assert.strictEqual(page.$("headline").textContent, "Waiting for your answer");
+    page.click(gate.querySelectorAll("button")[2]); // +2 min
+    await sleep(60);
+    ctl = page.sent.filter((m) => m.method === "timer.control").pop().params;
+    assert.deepStrictEqual([ctl.action, ctl.answer, ctl.to_index], ["answer", 120, fx.at_gate.waiting[0].index]);
+    page.click(page.doc.querySelector('[data-track="fish"] .gate button')); // Done
+    await sleep(60);
+    ctl = page.sent.filter((m) => m.method === "timer.control").pop().params;
+    assert.strictEqual(ctl.answer, "yes");
+
+    page.send({ event: { type: "timer", change: "finish", timer: fx.finished } });
+    await sleep(300);
+    assert.strictEqual(page.$("headline").textContent, "Dinner is ready");
+    assert.deepStrictEqual(page.errors, []);
+    page.close();
+  });
+
   // --------------------------------------------------------------- house board
   await ok("house-board: entities, service call, shared notes", async () => {
     const states = {
