@@ -183,6 +183,17 @@ need to agree. The full reference Claude reads is `AUTHORING_GUIDE` in `llm_api.
   early Next, and is marked `skipped` if Next ends that step first) or `"timer"` (fixed offset from the start, unaffected
   by overtime). `view.reminders` lists `{index, label, state: pending|fired|skipped, due, firedAt}` for "Rice check · 2 min
   ago" chips; a reminder gets its own phone alert while the ongoing notification keeps the current step.
+  Step kinds at a glance (set per step; a step is exactly one):
+
+  | Kind | How to write it | Becomes current | Ends the current step | Allowed extras |
+  |---|---|---|---|---|
+  | manual | `advance: "manual"` | yes, and holds in overtime | only when you press Next | `duration`, `gate`, `remindEvery`, `after` |
+  | auto (default) | `advance: "auto"` or nothing | yes | when the next step is due | `duration`, `gate`, `endLabel`, `after` |
+  | reminder | `reminder: true` (or `kind: "reminder"`) | never | never | `anchor` only |
+
+  A reminder is only a timed alert plus a chip in `view.reminders`. It is never inferred from the order of manual and
+  auto steps, and combining `reminder` with `advance`, `gate`, `duration`, `endLabel`, `after` or `remindEvery` is
+  rejected with an `invalid` error.
   Only that step's lane waits. `timer.step_log` records planned vs actual per Next; `reset`/`start` restore the original
   schedule; `html_artifacts_timer_overtime` fires for automations.
 - **History.** `timer.history` records every start, pause, resume, extend, skip and answer (time, lane, step, source) and
