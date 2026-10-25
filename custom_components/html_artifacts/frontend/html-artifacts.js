@@ -97,6 +97,44 @@
     const timers = new Map();
 
     const post = (msg) => parent.postMessage(Object.assign({ ha: 1 }, msg), "*");
+
+    // Diagnostics: tell the host what went wrong so artifact_check can report it to Claude.
+    let reported = 0;
+    const report = (level, message, line) => {
+      if (reported >= 20) return;
+      reported++;
+      post({ notify: "report", level, message: String(message).slice(0, 500), line: line > 0 ? line : 0 });
+    };
+    window.addEventListener(
+      "error",
+      (e) => {
+        const t = e.target;
+        if (t && t !== window && t.tagName) {
+          report("error", "Failed to load <" + String(t.tagName).toLowerCase() + "> " + (t.src || t.href || ""));
+        } else {
+          report("error", e.message || "Script error", e.lineno);
+        }
+      },
+      true
+    );
+    window.addEventListener("unhandledrejection", (e) => {
+      const r = e.reason;
+      report("error", "Unhandled promise rejection: " + ((r && r.message) || r));
+    });
+    document.addEventListener("securitypolicyviolation", (e) =>
+      report("warning", "Blocked by security policy (" + e.violatedDirective + "): " + (e.blockedURI || "inline"), e.lineNumber)
+    );
+    const originalConsoleError = console.error;
+    console.error = function () {
+      try {
+        report("console", Array.prototype.map.call(arguments, (a) => (a && a.message) || String(a)).join(" "));
+      } catch (x) {
+        /* never break the page's own logging */
+      }
+      return originalConsoleError.apply(console, arguments);
+    };
+    window.addEventListener("load", () => setTimeout(() => post({ notify: "settled" }), 1500));
+
     const call = (method, params) =>
       new Promise((resolve, reject) => {
         const id = ++seq;
@@ -297,14 +335,33 @@
     }
   }
 
-  function composeDocument(html, grants) {
+  function composeWithMeta(html, grants) {
     const snippet =
       '<meta http-equiv="Content-Security-Policy" content="' +
       esc(buildCsp(grants)) +
       '"><script>(' +
       bridgeMain.toString() +
       ")();<\/script>";
-    return injectIntoHead(html, snippet);
+    const doc = injectIntoHead(html, snippet);
+    const at = doc.indexOf(snippet);
+    return {
+      doc,
+      // 1-based line where the injected bridge starts, and how many lines it adds
+      injectLine: doc.slice(0, at).split("\n").length,
+      offset: snippet.split("\n").length - 1,
+    };
+  }
+
+  function composeDocument(html, grants) {
+    return composeWithMeta(html, grants).doc;
+  }
+
+  // Map a line number in the composed document back to the author's html (null: inside the bridge).
+  function userLine(meta, line) {
+    if (!(line > 0) || !meta) return null;
+    if (line < meta.injectLine) return line;
+    if (line >= meta.injectLine + meta.offset) return line - meta.offset;
+    return null;
   }
 
   // ------------------------------------------------------------------------
@@ -318,6 +375,12 @@
       this.autoHeight = !!opts.autoHeight;
       this.height = opts.height || 0;
       this.onRemoteChange = opts.onRemoteChange || null;
+      this._queue = [];
+      this._settledPending = false;
+      this._reporting = false;
+      this._flushTimer = null;
+      this._meta = null;
+      this._liveKey = null;
       this.artifact = null;
       this.grants = {};
       this.iframe = null;
@@ -339,7 +402,46 @@
       }
     }
 
+    _setLive(key) {
+      const live = (window.__htmlArtifactsLive = window.__htmlArtifactsLive || new Set());
+      if (this._liveKey) live.delete(this._liveKey);
+      this._liveKey = key;
+      if (key) live.add(key);
+    }
+
+    _queueReport(entry) {
+      if (!this._reporting) return;
+      const out = { level: entry.level, message: entry.message };
+      const line = userLine(this._meta, entry.line);
+      if (line) out.line = line;
+      this._queue.push(out);
+      this._flushSoon();
+    }
+
+    _flushSoon() {
+      if (this._flushTimer || !this._reporting) return;
+      this._flushTimer = setTimeout(() => this._flush(), 400);
+    }
+
+    _flush() {
+      this._flushTimer = null;
+      if (!this._reporting || !this.artifact || (!this._queue.length && !this._settledPending)) return;
+      const msg = {
+        type: WS + "report",
+        artifact_id: this.artifact.id,
+        version: this._version,
+        source: "viewer",
+        settled: this._settledPending,
+        errors: this._queue.splice(0, 20),
+      };
+      this._settledPending = false;
+      Promise.resolve(this.hass.connection.sendMessagePromise(msg)).catch(() => {});
+    }
+
     destroy() {
+      clearTimeout(this._flushTimer);
+      this._flushTimer = null;
+      this._setLive(null);
       window.removeEventListener("message", this._onMessage);
       if (this._unsub) {
         this._unsub();
@@ -349,8 +451,14 @@
       this.iframe = null;
     }
 
-    mount(artifact, html) {
+    mount(artifact, html, opts) {
       this.artifact = artifact;
+      this._version = artifact.version;
+      this._queue = [];
+      this._settledPending = false;
+      // unsaved editor text must not be reported against the saved version
+      this._reporting = !(opts && opts.report === false);
+      this._setLive(this._reporting ? `${artifact.id}@${artifact.version}` : null);
       this.grants = artifact.caps_granted || {};
       this._wanted.clear();
       this._last.clear();
@@ -360,7 +468,8 @@
       frame.setAttribute("title", artifact.title || artifact.id);
       const h = this.autoHeight ? "300px" : this.height ? this.height + "px" : "100%";
       frame.style.cssText = `border:0;width:100%;height:${h};display:block;background:transparent`;
-      frame.srcdoc = composeDocument(html !== undefined ? html : artifact.html, this.grants);
+      this._meta = composeWithMeta(html !== undefined ? html : artifact.html, this.grants);
+      frame.srcdoc = this._meta.doc;
       if (this.iframe) this.iframe.remove();
       this.iframe = frame;
       this.host.replaceChildren(frame);
@@ -430,6 +539,15 @@
       if (!m || m.ha !== 1) return;
       if (m.notify === "resize") {
         if (this.autoHeight && Number.isFinite(m.height)) this.iframe.style.height = Math.max(60, m.height) + "px";
+        return;
+      }
+      if (m.notify === "report") {
+        this._queueReport({ level: m.level, message: m.message, line: m.line });
+        return;
+      }
+      if (m.notify === "settled") {
+        this._settledPending = true;
+        this._flushSoon();
         return;
       }
       if (!m.id) return;
@@ -956,7 +1074,7 @@
 
     _renderPreview() {
       if (!this._cur || !this._runner) return;
-      this._runner.mount(this._cur, this.$("editor").value);
+      this._runner.mount(this._cur, this.$("editor").value, { report: !this._dirty });
     }
 
     async _refreshHistory() {
@@ -1241,6 +1359,149 @@
   }
 
   // ------------------------------------------------------------------------
+  // Render check. When Claude publishes a new version, one open Home Assistant tab renders it
+  // in a hidden frame and reports what broke (artifact_check reads that report). The frame's
+  // `ha` calls are answered by stubs below: nothing reaches Home Assistant, so a page can never
+  // call a service, send a notification or start a timer just because it was published.
+  // Opt out in a browser with: localStorage.setItem("html_artifacts:dry_run", "off")
+  // ------------------------------------------------------------------------
+
+  function dryReply(method, p, art) {
+    switch (method) {
+      case "hello":
+        return {
+          user: { id: "dry-run", name: "Dry run", is_admin: false },
+          artifact: { id: art.id, title: art.title, version: art.version },
+          grants: art.caps_granted || {},
+          timers: [],
+          theme: { dark: false, vars: {} },
+        };
+      case "kv.list":
+      case "entities.get":
+      case "entities.subscribe":
+        return {};
+      case "kv.set":
+      case "kv.delete":
+      case "service.call":
+      case "notify":
+        return true;
+      case "timer.list":
+        return [];
+      case "timer.create":
+      case "timer.control":
+        return {
+          id: "dry-run", artifact_id: art.id, label: (p && p.label) || "", state: "idle",
+          duration: (p && p.duration) || 0, steps: (p && p.steps) || [], elapsed_now: 0, notify_targets: [],
+        };
+      default:
+        return null;
+    }
+  }
+
+  function dryRun(art, timeoutMs) {
+    timeoutMs = timeoutMs || 8000;
+    return new Promise((resolve) => {
+      const meta = composeWithMeta(art.html, art.caps_granted || {});
+      const box = document.createElement("div");
+      box.style.cssText = "position:fixed;left:-10000px;top:0;width:420px;height:800px;overflow:hidden;opacity:0;pointer-events:none";
+      const frame = document.createElement("iframe");
+      frame.setAttribute("sandbox", "allow-scripts"); // no forms, modals, downloads or popups
+      frame.setAttribute("aria-hidden", "true");
+      frame.tabIndex = -1;
+      frame.style.cssText = "border:0;width:420px;height:800px";
+      frame.srcdoc = meta.doc;
+      const errors = [];
+      let done = false;
+      let timer = null;
+      const finish = (settled) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        window.removeEventListener("message", onMessage);
+        box.remove();
+        resolve({ settled, errors });
+      };
+      const onMessage = (e) => {
+        if (e.source !== frame.contentWindow) return;
+        const m = e.data;
+        if (!m || m.ha !== 1) return;
+        if (m.notify === "report") {
+          const entry = { level: m.level, message: m.message };
+          const line = userLine(meta, m.line);
+          if (line) entry.line = line;
+          errors.push(entry);
+        } else if (m.notify === "settled") {
+          finish(true);
+        } else if (m.id && frame.contentWindow) {
+          frame.contentWindow.postMessage({ ha: 1, id: m.id, result: dryReply(m.method, m.params || {}, art) }, "*");
+        }
+      };
+      window.addEventListener("message", onMessage);
+      timer = setTimeout(() => {
+        errors.push({ level: "error", message: `The page did not finish loading within ${timeoutMs / 1000}s.` });
+        finish(false);
+      }, timeoutMs);
+      box.append(frame);
+      document.body.append(box);
+    });
+  }
+
+  function startValidator() {
+    if (typeof document.querySelector !== "function" || window.__htmlArtifactsValidator) return;
+    window.__htmlArtifactsValidator = true;
+    try {
+      if (localStorage.getItem("html_artifacts:dry_run") === "off") return;
+      // drop locks left behind by closed tabs
+      for (const k of Object.keys(localStorage)) {
+        if (k.startsWith("html_artifacts:dry:") && Date.now() - Number(localStorage.getItem(k)) > 3600000) localStorage.removeItem(k);
+      }
+    } catch (err) {
+      /* storage unavailable: carry on without cross-tab locking */
+    }
+    const validated = new Map();
+
+    const check = async (conn, id, version) => {
+      const live = window.__htmlArtifactsLive;
+      if (live && live.has(`${id}@${version}`)) return; // someone is already viewing it and reporting
+      const key = `html_artifacts:dry:${id}@${version}`;
+      try {
+        const t = Number(localStorage.getItem(key));
+        if (t && Date.now() - t < 120000) return; // another tab got there first
+        localStorage.setItem(key, String(Date.now()));
+      } catch (err) {
+        /* no locking */
+      }
+      const art = await conn.sendMessagePromise({ type: WS + "get", artifact_id: id });
+      if (art.version !== version) return; // superseded already
+      const res = await dryRun(art);
+      await conn.sendMessagePromise({
+        type: WS + "report", artifact_id: id, version, source: "dry-run",
+        settled: res.settled, errors: res.errors.slice(0, 20),
+      });
+    };
+
+    const onEvent = (conn, ev) => {
+      if (!ev || ev.type !== "artifact" || ev.change !== "save" || !ev.artifact) return;
+      const a = ev.artifact;
+      if (validated.get(a.id) === a.version) return;
+      validated.set(a.id, a.version);
+      setTimeout(() => check(conn, a.id, a.version).catch((e) => console.debug("html_artifacts check failed", e)), 1500);
+    };
+
+    let tries = 0;
+    const connect = () => {
+      const root = document.querySelector("home-assistant");
+      const conn = root && root.hass && root.hass.connection;
+      if (!conn) {
+        if (++tries < 200) setTimeout(connect, tries < 30 ? 2000 : 20000);
+        return;
+      }
+      Promise.resolve(conn.subscribeMessage((ev) => onEvent(conn, ev), { type: WS + "subscribe" })).catch(() => {});
+    };
+    connect();
+  }
+
+  // ------------------------------------------------------------------------
   // Visual editor for the card (Dashboard > Edit > Add card > HTML Artifact)
   // ------------------------------------------------------------------------
 
@@ -1334,5 +1595,12 @@
     });
   }
 
-  window.__htmlArtifacts = { injectIntoHead, buildCsp, bridgeMain, globToRegExp, pendingCaps, composeDocument };
+  window.__htmlArtifacts = {
+    injectIntoHead, buildCsp, bridgeMain, globToRegExp, pendingCaps, composeDocument, composeWithMeta, userLine, dryRun, dryReply,
+  };
+  try {
+    startValidator();
+  } catch (err) {
+    console.debug("html_artifacts validator not started", err);
+  }
 })();

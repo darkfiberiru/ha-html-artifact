@@ -81,9 +81,22 @@ const ok = (name, fn) => Promise.resolve().then(fn).then(() => { passed++; conso
   const posted = [];
   const listeners = [];
   const parent = { postMessage: (m) => posted.push(m) };
-  const bwin = { addEventListener: (t, fn) => t === "message" && listeners.push(fn) };
+  const winHandlers = {};
+  const docHandlers = {};
+  const bwin = {
+    addEventListener: (t, fn) => {
+      if (t === "message") listeners.push(fn);
+      (winHandlers[t] = winHandlers[t] || []).push(fn);
+    },
+  };
   const root = { setAttribute() {}, style: { setProperty() {} } };
-  const sandbox = { parent, window: bwin, document: { documentElement: root }, performance: { now: () => now }, console };
+  const timeouts = [];
+  const fakeConsole = { error() {}, log() {} };
+  const sandbox = {
+    parent, window: bwin, performance: { now: () => now }, console: fakeConsole,
+    document: { documentElement: root, addEventListener: (t, fn) => (docHandlers[t] = docHandlers[t] || []).push(fn) },
+    setTimeout: (fn, ms) => timeouts.push({ fn, ms }),
+  };
   vm.createContext(sandbox);
   vm.runInContext("(" + T.bridgeMain.toString() + ")()", sandbox);
   const ha = bwin.ha;
@@ -180,6 +193,64 @@ const ok = (name, fn) => Promise.resolve().then(fn).then(() => { passed++; conso
     deliver({ event: { type: "state", entity_id: "sensor.oven", state: { state: "180" } } });
     deliver({ event: { type: "state", entity_id: "sensor.other", state: { state: "1" } } });
     assert.deepStrictEqual(states, [["sensor.oven", "20"], ["sensor.oven", "180"]]);
+  });
+
+  // ---- diagnostics (what artifact_check reports) -----------------------------
+  await ok("bridge reports errors, rejections, console.error and CSP blocks, capped at 20", () => {
+    const reports = () => posted.filter((m) => m.notify === "report");
+    const before = reports().length;
+    winHandlers.error[0]({ message: "ReferenceError: x is not defined", lineno: 42 });
+    winHandlers.error[0]({ target: { tagName: "IMG", src: "https://example.org/a.png" } });
+    winHandlers.unhandledrejection[0]({ reason: new Error("kaput") });
+    docHandlers.securitypolicyviolation[0]({ violatedDirective: "connect-src", blockedURI: "https://api.example", lineNumber: 9 });
+    const logged = [];
+    fakeConsole.error("oops", { message: "inner" });
+    const mine = reports().slice(before).map(plain);
+    assert.deepStrictEqual(mine.map((m) => m.level), ["error", "error", "error", "warning", "console"]);
+    assert.strictEqual(mine[0].message, "ReferenceError: x is not defined");
+    assert.strictEqual(mine[0].line, 42);
+    assert(mine[1].message.includes("Failed to load <img> https://example.org/a.png"));
+    assert(mine[2].message.includes("kaput"));
+    assert(mine[3].message.includes("connect-src") && mine[3].line === 9);
+    assert.strictEqual(mine[4].message, "oops inner");
+    for (let i = 0; i < 40; i++) winHandlers.error[0]({ message: "spam " + i });
+    assert(reports().length <= 20, "bridge stops reporting after 20: " + reports().length);
+    assert.strictEqual(typeof logged, "object");
+  });
+  await ok("bridge announces 'settled' 1.5s after load", () => {
+    winHandlers.load[0]();
+    const t = timeouts.find((x) => x.ms === 1500);
+    assert(t, "settle timer scheduled");
+    t.fn();
+    assert(posted.some((m) => m.notify === "settled"));
+  });
+  await ok("composeWithMeta maps document lines back to the author's lines", () => {
+    const html = "<!doctype html>\n<html>\n<head>\n<title>t</title>\n</head>\n<body>\n<script>\nboom();\n</script>\n</body>\n</html>";
+    const meta = T.composeWithMeta(html, {});
+    const lines = meta.doc.split("\n");
+    const lineOfBoom = lines.findIndex((l) => l.trim() === "boom();") + 1;
+    assert(lineOfBoom > 8, "bridge pushes the script down in the composed doc");
+    assert.strictEqual(T.userLine(meta, lineOfBoom), 8, "boom() is line 8 of the author's html");
+    assert.strictEqual(T.userLine(meta, 2), 2, "lines before the bridge are unchanged");
+    assert.strictEqual(T.userLine(meta, meta.injectLine + 3), null, "lines inside the bridge map to nothing");
+    assert.strictEqual(T.userLine(meta, 0), null);
+    assert.strictEqual(T.composeDocument(html, {}), meta.doc);
+    // pages without a <head> still map correctly
+    const bare = T.composeWithMeta("<p>a</p>\n<script>\nx()\n</script>", {});
+    const ln = bare.doc.split("\n").findIndex((l) => l.trim() === "x()") + 1;
+    assert.strictEqual(T.userLine(bare, ln), 3);
+  });
+  await ok("dry-run stubs never touch Home Assistant and keep pages from crashing", () => {
+    const art = { id: "a", title: "A", version: 4, caps_granted: { notify: true } };
+    assert.strictEqual(plain(T.dryReply("hello", {}, art)).artifact.version, 4);
+    assert.deepStrictEqual(plain(T.dryReply("hello", {}, art)).timers, []);
+    for (const m of ["service.call", "notify", "kv.set", "kv.delete"]) assert.strictEqual(T.dryReply(m, {}, art), true, m);
+    for (const m of ["kv.list", "entities.get", "entities.subscribe"]) assert.deepStrictEqual(plain(T.dryReply(m, {}, art)), {}, m);
+    assert.strictEqual(T.dryReply("kv.get", { key: "x" }, art), null);
+    const timer = plain(T.dryReply("timer.create", { label: "Rice", duration: 60, steps: [{ at: 0, label: "go" }] }, art));
+    assert.strictEqual(timer.state, "idle", "a dry-run timer never starts");
+    assert.strictEqual(timer.label, "Rice");
+    assert.deepStrictEqual(plain(T.dryReply("timer.list", {}, art)), []);
   });
 
   console.log(`\n${passed} frontend checks passed`);

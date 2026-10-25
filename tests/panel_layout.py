@@ -29,22 +29,25 @@ HARNESS = """
 <body><div id=slot></div>
 <script>
 const ARTS = %s;
-window.__sent = [];
+window.__sent = []; window.__msgs = []; window.__calls = []; window.__subs = [];
 const hass = {
   states: {}, themes: {darkMode: true},
   connection: {
     sendMessagePromise: async (m) => {
-      window.__sent.push(m.type);
+      window.__sent.push(m.type); window.__msgs.push(m);
       if (m.type.endsWith('/timers/list')) return {timers: []};
+      if (m.type.endsWith('/timers/create') || m.type.endsWith('/timers/control')) return {timer: {id: 't1', artifact_id: m.artifact_id, label: 'x', state: 'running', duration: 60, steps: [], elapsed_now: 0, notify_targets: []}};
       if (m.type.endsWith('/list')) return {artifacts: ARTS.map(a => Object.assign({}, a, {html: undefined}))};
       if (m.type.endsWith('/get')) { const a = ARTS.find(a => a.id === m.artifact_id); if (!a) throw new Error("artifact '" + m.artifact_id + "' does not exist"); return a; }
       if (m.type.endsWith('/history')) return {history: []};
       if (m.type.endsWith('/timers/list') || m.type.endsWith('/hello')) return {timers: []};
       return null;
     },
-    subscribeMessage: async () => () => {},
+    subscribeMessage: async (cb) => { window.__subs.push(cb); return () => {}; },
   },
+  callService: (...a) => { window.__calls.push(a); },
 };
+const haRoot = document.createElement('home-assistant'); haRoot.hass = hass; document.body.appendChild(haRoot);
 </script>
 <script>%s</script>
 <script>
@@ -217,6 +220,125 @@ with sync_playwright() as pw:
     check("recipe" in msg and "board" in msg and "Use the artifact" in msg, f"unknown artifact lists the valid ids ({msg[:110]})")
     check(not errs, "no page errors " + "; ".join(errs))
     page.close()
+
+    # ---- render check: viewer reports, hidden dry run, no side effects ------------------
+    print("\n[render check]")
+    BAD = "\n".join([
+        "<!doctype html>", "<html>", '<head><meta name="viewport" content="width=device-width"><title>bad</title></head>', "<body>", "<script>",
+        'ha.ready.then(() => { ha.callService("light", "turn_on", {}, {entity_id: "light.x"}); ha.notify("hello", "t");',
+        '  ha.kv.set("k", 1); ha.timers.create({label: "x", duration: 60, start: true}); });',
+        'console.error("something is wrong");',
+        'fetch("https://api.example/x").catch(() => {});',
+        'Promise.reject(new Error("late failure"));',
+        "undefinedFunction();",
+        "</script>", "</body>", "</html>"])
+    GOOD = "<!doctype html><html><head><meta name='viewport' content='width=device-width'></head><body><p id=x>fine</p><script>document.getElementById('x').textContent='ok'</script></body></html>"
+    caps = {"entities": [], "services": ["light.turn_on"], "notify": True, "network": False}
+    THROW_LINE = BAD.split("\n").index("undefinedFunction();") + 1
+    CHECK_ARTS = [
+        {"id": "bad", "title": "Bad", "version": 3, "updated_by": "claude", "updated": 1, "caps_requested": caps, "caps_granted": caps, "html": BAD},
+        {"id": "good", "title": "Good", "version": 2, "updated_by": "claude", "updated": 1, "caps_requested": caps, "caps_granted": caps, "html": GOOD},
+    ]
+
+    def new_page(init=None):
+        pg = browser.new_page(viewport={"width": 900, "height": 700})
+        perr = []
+        pg.on("pageerror", lambda e: perr.append(str(e)) if not any(k in str(e) for k in ("undefinedFunction", "late failure")) else None)  # the broken test page throws on purpose
+        if init:
+            pg.add_init_script(init)
+        body = HARNESS % ("height:100%", json.dumps(CHECK_ARTS).replace("</", "<\\/"), JS)  # keep </script> in test pages from ending the harness script
+        pg.route("http://harness.test/", lambda route: route.fulfill(status=200, content_type="text/html", body=body))
+        pg.goto("http://harness.test/")
+        return pg, perr
+
+    def reports(pg, source=None):
+        return pg.evaluate("(src) => __msgs.filter(m => m.type.endsWith('/report') && (!src || m.source === src))", source)
+
+    def emit(pg, change, artifact):
+        pg.evaluate("([c, a]) => __subs.forEach(cb => cb({type: 'artifact', change: c, artifact: a}))", [change, artifact])
+
+    def side_effects(pg):
+        sent = pg.evaluate("__sent")
+        bad = [t for t in sent if t.split('/', 1)[-1] in ("notify", "kv/set", "kv/delete", "timers/create", "timers/control", "save")]
+        return bad, pg.evaluate("__calls.length")
+
+    # 1. a person viewing a broken page: the browser reports it (source=viewer), with the author's line number
+    pg, perr = new_page()
+    pg.evaluate("""() => { const c = document.createElement('html-artifact-card'); document.getElementById('slot').appendChild(c);
+        c.setConfig({artifact: 'bad', height: 300}); c.hass = hass; }""")
+    pg.wait_for_function("__msgs.some(m => m.type.endsWith('/report') && m.settled)", timeout=9000)
+    rep = reports(pg, "viewer")
+    errs_ = [e for r in rep for e in r["errors"]]
+    ref = next((e for e in errs_ if "undefinedFunction" in e["message"]), None)
+    check(ref is not None and ref.get("line") == THROW_LINE, f"viewer report has the ReferenceError at the author's line {THROW_LINE} ({ref})")
+    check(any(e["level"] == "console" and "something is wrong" in e["message"] for e in errs_), "console.error is reported")
+    check(any(e["level"] == "error" and "late failure" in e["message"] for e in errs_), "unhandled promise rejection is reported")
+    check(any(e["level"] == "warning" and "connect-src" in e["message"] for e in errs_), "a request blocked by the security policy is reported")
+    check(all(r["version"] == 3 and r["artifact_id"] == "bad" for r in rep), "reports carry the artifact id and version")
+    # 2. someone is already viewing it, so no hidden duplicate run for that version
+    emit(pg, "save", {"id": "bad", "version": 3})
+    pg.wait_for_timeout(3500)
+    check(not reports(pg, "dry-run"), "no dry run while a viewer is already reporting that version")
+    check(not perr, "no unexpected page errors: " + "; ".join(perr))
+    pg.close()
+
+    # 3. Claude publishes a new version and nobody is viewing: one hidden dry run reports it
+    pg, perr = new_page()
+    pg.wait_for_timeout(300)
+    emit(pg, "save", {"id": "bad", "version": 3})
+    pg.wait_for_function("__msgs.some(m => m.type.endsWith('/report') && m.source === 'dry-run')", timeout=10000)
+    rep = reports(pg, "dry-run")
+    errs_ = [e for r in rep for e in r["errors"]]
+    ref = next((e for e in errs_ if "undefinedFunction" in e["message"]), None)
+    check(rep[0]["settled"] is True and ref is not None and ref.get("line") == THROW_LINE, f"dry run reports the error with the author's line {THROW_LINE} ({ref})")
+    check(any("something is wrong" in e["message"] for e in errs_), "dry run reports console.error too")
+    bad, direct = side_effects(pg)
+    check(not bad and direct == 0, f"dry run caused NO service calls, notifications, kv writes or timers (ws={bad}, hass.callService={direct})")
+    check(pg.evaluate("document.querySelectorAll('iframe').length") == 0, "the hidden frame is removed afterwards")
+    # same version again, a grants-only change, and a duplicate: nothing more happens
+    n = len(reports(pg))
+    emit(pg, "save", {"id": "bad", "version": 3})
+    emit(pg, "grants", {"id": "bad", "version": 3})
+    pg.wait_for_timeout(3500)
+    check(len(reports(pg)) == n, "the same version is not checked twice, and grant changes are ignored")
+    check(not perr, "no unexpected page errors: " + "; ".join(perr))
+    pg.close()
+
+    # 4. a clean page reports settled with no errors
+    pg, perr = new_page()
+    pg.wait_for_timeout(300)
+    emit(pg, "save", {"id": "good", "version": 2})
+    pg.wait_for_function("__msgs.some(m => m.type.endsWith('/report') && m.source === 'dry-run')", timeout=10000)
+    rep = reports(pg, "dry-run")[0]
+    check(rep["settled"] is True and rep["errors"] == [], f"a clean page reports settled with no errors ({rep['errors']})")
+    pg.close()
+
+    # 5. another tab already holds the lock for that version
+    pg, perr = new_page("localStorage.setItem('html_artifacts:dry:good@2', String(Date.now()))")
+    pg.wait_for_timeout(300)
+    emit(pg, "save", {"id": "good", "version": 2})
+    pg.wait_for_timeout(3500)
+    check(not reports(pg), "another tab's lock prevents a duplicate dry run")
+    pg.close()
+
+    # 6. opt-out switch
+    pg, perr = new_page("localStorage.setItem('html_artifacts:dry_run', 'off')")
+    pg.wait_for_timeout(500)
+    emit(pg, "save", {"id": "good", "version": 2})
+    pg.wait_for_timeout(3500)
+    check(not reports(pg) and pg.evaluate("__subs.length") == 0, "localStorage opt-out disables the background check entirely")
+    pg.close()
+
+    # 7. a page that never finishes loading is reported instead of hanging the check
+    SLOW = "<!doctype html><html><head></head><body><script>document.write('<' + 'script src=\"https://cdn.jsdelivr.net/npm/never-loads@1/x.js\"></' + 'script>')</script></body></html>"
+    CHECK_ARTS.append({"id": "slow", "title": "Slow", "version": 1, "updated_by": "claude", "updated": 1, "caps_requested": caps, "caps_granted": caps, "html": SLOW})
+    pg, perr = new_page()
+    pg.wait_for_timeout(300)
+    emit(pg, "save", {"id": "slow", "version": 1})
+    pg.wait_for_function("__msgs.some(m => m.type.endsWith('/report') && m.source === 'dry-run')", timeout=20000)
+    rep = reports(pg, "dry-run")[0]
+    check(rep["errors"] or rep["settled"], f"a page with a failing external script still produces a report ({rep['settled']}, {len(rep['errors'])} errors)")
+    pg.close()
     browser.close()
 
 print("\nFAILED" if FAILS else "\nlayout checks passed")
