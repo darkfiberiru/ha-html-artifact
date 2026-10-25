@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 DOMAIN = "html_artifacts"
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 PANEL_URL_PATH = "html-artifacts"
 PANEL_ELEMENT = "html-artifacts-panel"
@@ -14,6 +14,7 @@ CONF_LIVE = "live_notification"
 CONF_REPO = "github_repo"
 CONF_GITHUB_TOKEN = "github_token"
 CONF_AUTO_RESTART = "auto_restart"
+CONF_FORCE_SELF_UPDATE = "force_self_update"
 DEFAULT_REPO = "darkfiberiru/ha-html-artifact"
 
 EVENT_STEP = "html_artifacts_timer_step"

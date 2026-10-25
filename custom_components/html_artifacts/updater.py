@@ -197,3 +197,19 @@ def install_component(data: bytes, domain: str, dest: Path) -> str:
         return str(manifest["version"])
     finally:
         shutil.rmtree(staging, ignore_errors=True)
+
+
+def hacs_manages(storage_text: str | None, repo: str) -> bool:
+    """True if HACS's own storage lists `repo` as installed (so HACS owns updates)."""
+    if not storage_text:
+        return False
+    try:
+        data = json.loads(storage_text).get("data")
+    except (ValueError, AttributeError):
+        return False
+    entries = data.values() if isinstance(data, dict) else (data if isinstance(data, list) else [])
+    wanted = repo.strip().lower()
+    for item in entries:
+        if isinstance(item, dict) and str(item.get("full_name", "")).lower() == wanted and item.get("installed"):
+            return True
+    return False

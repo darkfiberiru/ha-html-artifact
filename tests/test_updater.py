@@ -10,7 +10,7 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "custom_components" / "html_artifacts"))
 import updater  # noqa: E402
-from updater import UpdateError, fetch_latest, install_component, is_newer, parse_version  # noqa: E402
+from updater import UpdateError, fetch_latest, hacs_manages, install_component, is_newer, parse_version  # noqa: E402
 
 DOMAIN = "html_artifacts"
 
@@ -208,6 +208,20 @@ class Install(unittest.TestCase):
         finally:
             pathlib.Path.rename = real_rename
         self._assert_untouched()
+
+
+class HacsDetection(unittest.TestCase):
+    def store(self, **item):
+        return json.dumps({"version": 1, "data": {"123": item}})
+
+    def test_detects_installed_repo_case_insensitively(self):
+        self.assertTrue(hacs_manages(self.store(full_name="DarkFiberIru/ha-html-artifact", installed=True), "darkfiberiru/ha-html-artifact"))
+
+    def test_ignores_uninstalled_other_repo_and_junk(self):
+        self.assertFalse(hacs_manages(self.store(full_name="darkfiberiru/ha-html-artifact", installed=False), "darkfiberiru/ha-html-artifact"))
+        self.assertFalse(hacs_manages(self.store(full_name="someone/else", installed=True), "darkfiberiru/ha-html-artifact"))
+        for junk in (None, "", "not json", "[]", json.dumps({"data": 5}), json.dumps({"data": ["x", 3]})):
+            self.assertFalse(hacs_manages(junk, "a/b"))
 
 
 class ManifestInSync(unittest.TestCase):

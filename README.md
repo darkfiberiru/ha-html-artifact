@@ -42,6 +42,7 @@ update, with release notes and an **Install** button. After installing, restart 
 - **What counts as a new version:** the latest GitHub *release* if there is one, otherwise the `version` in
   `manifest.json` on the default branch. To ship an update, bump `version` in both `manifest.json` and `const.py`
   (a test fails if they differ) and push; optionally tag a release for release notes.
+- **HACS wins.** If HACS lists this repo as installed, the built-in updater doesn't create its entity (and removes an old one) so the two never disagree. Tick *Use the built-in updater even when HACS manages this integration* under **Configure** to override; it applies after a restart.
 - **Checked every 6 hours**, or run *Check for updates* on the entity.
 - Installing swaps `custom_components/html_artifacts` as a unit: the new copy is unpacked and validated first, and the old one is put back if the swap fails.
   Archives with links, unsafe paths or a different integration are refused. Your artifacts, state and timers live in HA storage and are untouched.

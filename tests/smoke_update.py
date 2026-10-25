@@ -143,6 +143,25 @@ async def main():
             assert "check the GitHub token" in str(err)
     assert (comp / "__init__.py").read_text() == before and ent3.installed_version == VERSION
     ok("download failure raises a readable error and changes nothing")
+    # HACS owns the repo -> built-in updater stands down and removes its stale entity
+    (pathlib.Path(config_dir) / ".storage").mkdir()
+    (pathlib.Path(config_dir) / ".storage" / "hacs.repositories").write_text(
+        json.dumps({"data": {"1": {"full_name": "o/r", "installed": True}}}))
+    removed, added = [], []
+    reg = SimpleNamespace(async_get_entity_id=lambda d, p, u: "update.html_artifacts_update_2", async_remove=removed.append)
+    with mock.patch.object(upd.er, "async_get", lambda h: reg):
+        await upd.async_setup_entry(hass, entry, lambda ents, upd_first=False: added.extend(ents))
+    assert added == [] and removed == ["update.html_artifacts_update_2"], (added, removed)
+    ok("HACS-managed repo: no built-in update entity, stale one removed")
+    forced = SimpleNamespace(entry_id="e1", options={CONF_REPO: "o/r", "force_self_update": True}, add_update_listener=entry.add_update_listener)
+    await upd.async_setup_entry(hass, forced, lambda ents, upd_first=False: added.extend(ents))
+    assert len(added) == 1
+    ok("force_self_update keeps the built-in entity")
+    (pathlib.Path(config_dir) / ".storage" / "hacs.repositories").unlink()
+    added.clear()
+    await upd.async_setup_entry(hass, entry, lambda ents, upd_first=False: added.extend(ents))
+    assert len(added) == 1
+    ok("no HACS: built-in entity is created")
     print("\nupdate entity checks passed")
 
 

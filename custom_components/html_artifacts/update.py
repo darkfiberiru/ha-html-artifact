@@ -12,12 +12,21 @@ from homeassistant.components.update import UpdateEntity, UpdateEntityFeature
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import CONF_AUTO_RESTART, CONF_GITHUB_TOKEN, CONF_REPO, DEFAULT_REPO, DOMAIN, VERSION
-from .updater import Release, UpdateError, download, fetch_latest, install_component, is_newer
+from .const import (
+    CONF_AUTO_RESTART,
+    CONF_FORCE_SELF_UPDATE,
+    CONF_GITHUB_TOKEN,
+    CONF_REPO,
+    DEFAULT_REPO,
+    DOMAIN,
+    VERSION,
+)
+from .updater import Release, UpdateError, download, fetch_latest, hacs_manages, install_component, is_newer
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -26,7 +35,24 @@ RESTART_NOTIFICATION = f"{DOMAIN}_restart"
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback) -> None:
+    repo = (entry.options.get(CONF_REPO) or DEFAULT_REPO).strip()
+    if not entry.options.get(CONF_FORCE_SELF_UPDATE, False) and await hass.async_add_executor_job(_hacs_owns, hass, repo):
+        # HACS already tracks this repo: a second update entity would only disagree with it.
+        registry = er.async_get(hass)
+        entity_id = registry.async_get_entity_id("update", DOMAIN, f"{entry.entry_id}_update")
+        if entity_id:
+            registry.async_remove(entity_id)
+        _LOGGER.info("HACS manages %s; the built-in updater is standing down", repo)
+        return
     async_add_entities([HtmlArtifactsUpdate(entry)], True)
+
+
+def _hacs_owns(hass: HomeAssistant, repo: str) -> bool:
+    try:
+        text = Path(hass.config.path(".storage", "hacs.repositories")).read_text("utf-8")
+    except OSError:
+        return False
+    return hacs_manages(text, repo)
 
 
 class HtmlArtifactsUpdate(UpdateEntity):

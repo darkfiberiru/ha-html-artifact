@@ -11,6 +11,7 @@ from homeassistant.helpers import selector
 
 from .const import (
     CONF_AUTO_RESTART,
+    CONF_FORCE_SELF_UPDATE,
     CONF_GITHUB_TOKEN,
     CONF_LIVE,
     CONF_NOTIFY_TARGETS,
@@ -69,6 +70,7 @@ class HtmlArtifactsOptionsFlow(config_entries.OptionsFlow):
                     CONF_GITHUB_TOKEN, description={"suggested_value": options.get(CONF_GITHUB_TOKEN, "")}
                 ): selector.TextSelector(selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)),
                 vol.Optional(CONF_AUTO_RESTART, default=options.get(CONF_AUTO_RESTART, False)): bool,
+                vol.Optional(CONF_FORCE_SELF_UPDATE, default=options.get(CONF_FORCE_SELF_UPDATE, False)): bool,
             }
         )
         return self.async_show_form(step_id="init", data_schema=schema)
