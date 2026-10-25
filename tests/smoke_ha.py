@@ -288,7 +288,7 @@ async def main():
 
             class _C:
                 async def read(self, n=-1):
-                    return stream.read(n)
+                    return stream.read(min(n, 1000) if n and n > 0 else 1000)  # partial reads, like aiohttp
 
             self.content = _C()
 

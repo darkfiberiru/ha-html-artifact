@@ -38,6 +38,26 @@ _STATUS = {
 }
 
 
+async def read_body(request: web.Request, limit: int) -> bytes:
+    """Read the whole request body as it streams in, refusing more than `limit` bytes.
+
+    (StreamReader.read(n) returns as soon as *some* data is there, so one call is
+    not enough for a large upload; request.read() would hit HA's 16 MB cap.)
+    """
+    if request.content_length and request.content_length > limit:
+        raise ArtifactError("too_large", f"upload is larger than {limit} bytes")
+    chunks, size = [], 0
+    while True:
+        chunk = await request.content.read(1 << 16)
+        if not chunk:
+            break
+        size += len(chunk)
+        if size > limit:
+            raise ArtifactError("too_large", f"upload is larger than {limit} bytes")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 class _Base(HomeAssistantView):
     requires_auth = True
 
@@ -160,11 +180,7 @@ class AssetView(_Base):
     async def put(self, request: web.Request, artifact_id: str, path: str) -> web.Response:
         try:
             rt = self._existing(artifact_id)
-            if request.content_length and request.content_length > MAX_FILE_BYTES:
-                raise ArtifactError("too_large", f"file is larger than {MAX_FILE_BYTES} bytes")
-            data = await request.content.read(MAX_FILE_BYTES + 1)
-            if len(data) > MAX_FILE_BYTES:
-                raise ArtifactError("too_large", f"file is larger than {MAX_FILE_BYTES} bytes")
+            data = await read_body(request, MAX_FILE_BYTES)
             entry = await rt.async_assets(
                 rt.assets.put, artifact_id, path, data, sha256=request.query.get("sha256")
             )
@@ -195,12 +211,7 @@ class UploadView(_Base):
             aid = ticket["artifact_id"]
             if not rt.artifacts.exists(aid):
                 raise ArtifactError("not_found", f"artifact '{aid}' does not exist")
-            limit = ticket["max_bytes"]
-            if request.content_length and request.content_length > limit:
-                raise ArtifactError("too_large", f"upload is larger than {limit} bytes")
-            data = await request.content.read(limit + 1)
-            if len(data) > limit:
-                raise ArtifactError("too_large", f"upload is larger than {limit} bytes")
+            data = await read_body(request, ticket["max_bytes"])
             if ticket["mode"] == "file":
                 result = await rt.async_assets(rt.assets.put, aid, ticket["path"], data, sha256=ticket["sha256"])
             else:
