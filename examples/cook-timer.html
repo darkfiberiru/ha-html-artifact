@@ -1,0 +1,174 @@
+<!doctype html>
+<!--
+  Example 1 of the framework: a cook-along page with a SERVER-SIDE timer.
+  Publish with capabilities {"notify": true} so the step alerts reach your phone.
+  Start it on the stove tablet, close it, reopen it on your phone: same step, same
+  countdown. The ingredient check-offs are shared the same way (ha.kv).
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pesto Tilapia</title>
+<style>
+  :root { --bg:#f4f6f3; --card:#fff; --fg:#1b2420; --muted:#5a6862; --line:#dbe2dd; --accent:#2c6a4c; --soft:#e2efe7; --warm:#a8690c; }
+  :root[data-theme="dark"] { --bg:#111614; --card:#1a211e; --fg:#e6ece8; --muted:#9aaaa2; --line:#2c3632; --accent:#84c7a3; --soft:#1f3329; --warm:#e5b252; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:16px; background:var(--bg); color:var(--fg); font:17px/1.5 system-ui,-apple-system,sans-serif; }
+  .wrap { max-width: 880px; margin: 0 auto; display: grid; gap: 14px; }
+  h1 { margin: 0; font-size: clamp(26px, 6vw, 38px); line-height: 1.1; }
+  .sub { color: var(--muted); margin: 4px 0 0; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 18px; }
+  .now { display: grid; gap: 6px; }
+  .tag { font-size: 12px; letter-spacing: .12em; text-transform: uppercase; color: var(--accent); font-weight: 700; }
+  .step-name { font-size: clamp(24px, 6vw, 34px); font-weight: 800; line-height: 1.15; }
+  .detail { color: var(--muted); }
+  .count { font-variant-numeric: tabular-nums; font-size: clamp(44px, 14vw, 84px); font-weight: 800; line-height: 1; color: var(--warm); }
+  .count small { font-size: 16px; font-weight: 600; color: var(--muted); display: block; letter-spacing: 0; }
+  .bar { height: 8px; border-radius: 999px; background: var(--line); overflow: hidden; }
+  .bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .25s linear; }
+  .btns { display: flex; flex-wrap: wrap; gap: 10px; }
+  button { font: inherit; font-weight: 700; border-radius: 12px; border: 1.5px solid var(--line); background: var(--card); color: var(--fg); padding: 12px 18px; min-height: 48px; cursor: pointer; }
+  button.main { background: var(--accent); border-color: var(--accent); color: var(--bg); flex: 1 1 180px; }
+  button:disabled { opacity: .45; cursor: default; }
+  ol { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
+  ol li { display: grid; grid-template-columns: 56px 1fr; gap: 12px; padding: 8px 10px; border-radius: 10px; }
+  ol li .m { font-variant-numeric: tabular-nums; font-weight: 700; color: var(--muted); }
+  ol li.done { opacity: .5; text-decoration: line-through; }
+  ol li.cur { background: var(--soft); outline: 2px solid var(--accent); }
+  ol li b { display: block; }
+  ol li span.d { color: var(--muted); font-size: 15px; }
+  .ing { display: grid; gap: 2px; }
+  .ing label { display: flex; gap: 10px; padding: 8px 0; border-bottom: 1px dashed var(--line); cursor: pointer; }
+  .ing input { width: 20px; height: 20px; accent-color: var(--accent); }
+  .ing input:checked + span { color: var(--muted); text-decoration: line-through; }
+  .muted { color: var(--muted); font-size: 14px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Pesto Tilapia &amp; Garlic Rice</h1>
+    <p class="sub">Tilapia loins with pesto and Parmesan over garlic jasmine rice. About 25 minutes.</p>
+  </header>
+
+  <section class="card now" aria-live="polite">
+    <span class="tag" id="state">Ready</span>
+    <div class="step-name" id="stepName">Press Start when the rice goes on</div>
+    <div class="detail" id="stepDetail"></div>
+    <div class="count" id="count">--:--<small id="countLabel">until the next step</small></div>
+    <div class="bar"><i id="bar"></i></div>
+    <div class="btns">
+      <button class="main" id="go">Start</button>
+      <button id="next" disabled>Next step</button>
+      <button id="plus" disabled>+1 min</button>
+      <button id="reset" disabled>Reset</button>
+    </div>
+    <div class="muted" id="note"></div>
+  </section>
+
+  <section class="card"><div class="tag" style="margin-bottom:8px">Steps</div><ol id="steps"></ol></section>
+  <section class="card"><div class="tag" style="margin-bottom:8px">Ingredients</div><div class="ing" id="ing"></div></section>
+</div>
+
+<script>
+const MIN = 60;
+const RECIPE = {
+  label: "Pesto Tilapia & Garlic Rice",
+  duration: 25 * MIN,
+  steps: [
+    { at: 0,        label: "Start the rice",  detail: "Rinse, add water, garlic powder and butter, press Cook." },
+    { at: 5 * MIN,  label: "Prep the fish",   detail: "Pat the loins dry and season with salt and pepper." },
+    { at: 12 * MIN, label: "Sear",            detail: "Hot oiled skillet, 4-5 minutes undisturbed until golden." },
+    { at: 17 * MIN, label: "Top and finish",  detail: "Flip, pesto and Parmesan on top, cover 5-6 minutes. 145F inside." },
+    { at: 24 * MIN, label: "Serve",           detail: "Fluff the rice, plate it, spoon the pan juices over the fish." },
+  ],
+};
+const INGREDIENTS = [
+  "1/2 cup jasmine rice", "3/4 cup water + 1 tbsp", "1/4 tsp garlic powder", "1 tsp butter or olive oil",
+  "2 tilapia loins", "2-3 tbsp basil pesto", "1/4 cup grated Parmesan", "1 tbsp cooking oil", "Salt and black pepper",
+];
+
+const $ = (id) => document.getElementById(id);
+const fmt = (s) => { s = Math.max(0, Math.ceil(s)); return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0"); };
+let timer = null;   // the last server snapshot (shared by every device)
+let checked = [];
+
+function render() {
+  const v = timer ? ha.timers.view(timer) : null;   // adds live elapsed/remaining/current/next
+  const state = v ? v.state : "idle";
+  $("state").textContent = { idle: "Ready", running: "Cooking", paused: "Paused", finished: "Done" }[state];
+  $("go").textContent = { idle: "Start", running: "Pause", paused: "Resume", finished: "Cook again" }[state];
+  for (const id of ["next", "plus", "reset"]) $(id).disabled = !v || state === "idle";
+  $("next").disabled = !v || !(state === "running" || state === "paused");
+  $("plus").disabled = $("next").disabled;
+
+  if (!v || state === "idle") {
+    $("stepName").textContent = "Press Start when the rice goes on";
+    $("stepDetail").textContent = "";
+    $("count").firstChild.textContent = "--:--";
+    $("bar").style.width = "0";
+  } else if (state === "finished") {
+    $("stepName").textContent = "Dinner is ready";
+    $("stepDetail").textContent = "";
+    $("count").firstChild.textContent = "0:00";
+    $("bar").style.width = "100%";
+  } else {
+    $("stepName").textContent = v.current ? v.current.label : "Getting started";
+    $("stepDetail").textContent = v.current && v.current.detail ? v.current.detail : "";
+    $("count").firstChild.textContent = fmt(v.nextIn);
+    $("countLabel").textContent = v.next ? "until: " + v.next.label : "until it is all done";
+    $("bar").style.width = (100 * v.elapsed / v.duration) + "%";
+  }
+  $("steps").innerHTML = RECIPE.steps.map((s, i) => {
+    const cls = v && state !== "idle" ? (state === "finished" || i < v.currentIndex ? "done" : i === v.currentIndex ? "cur" : "") : "";
+    return `<li class="${cls}"><span class="m">${s.at / MIN} min</span><span><b>${s.label}</b><span class="d">${s.detail}</span></span></li>`;
+  }).join("");
+}
+
+async function go() {
+  if (!timer) {
+    timer = await ha.timers.create({ label: RECIPE.label, steps: RECIPE.steps, duration: RECIPE.duration, start: true });
+  } else if (timer.state === "running") {
+    await ha.timers.pause(timer.id);
+  } else if (timer.state === "paused") {
+    await ha.timers.resume(timer.id);
+  } else {
+    await ha.timers.reset(timer.id);
+    await ha.timers.start(timer.id);
+  }
+}
+
+function renderIngredients() {
+  $("ing").innerHTML = INGREDIENTS.map((t, i) =>
+    `<label><input type="checkbox" data-i="${i}" ${checked.includes(i) ? "checked" : ""}><span>${t}</span></label>`).join("");
+}
+
+(async () => {
+  await ha.ready;
+  $("note").textContent = ha.grants && ha.grants.notify
+    ? "Step alerts and a live countdown go to your phone."
+    : "Ask the household admin to approve notifications for this page to get phone alerts.";
+
+  ha.timers.subscribe((list) => { timer = list[0] || null; render(); });
+  ha.timers.onFired(() => navigator.vibrate && navigator.vibrate([200, 100, 200]));
+  setInterval(render, 250);
+
+  checked = (await ha.kv.get("checked")) || [];
+  renderIngredients();
+  ha.kv.subscribe(({ key, value }) => { if (key === "checked") { checked = value || []; renderIngredients(); } });
+  $("ing").onchange = (e) => {
+    const i = Number(e.target.dataset.i);
+    checked = e.target.checked ? [...new Set([...checked, i])] : checked.filter((x) => x !== i);
+    ha.kv.set("checked", checked);
+  };
+
+  $("go").onclick = go;
+  $("next").onclick = () => ha.timers.skip(timer.id);
+  $("plus").onclick = () => ha.timers.extend(timer.id, 60);
+  $("reset").onclick = () => ha.timers.reset(timer.id);
+  try { await navigator.wakeLock.request("screen"); } catch (e) { /* optional */ }
+})();
+</script>
+</body>
+</html>

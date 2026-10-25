@@ -1,0 +1,13 @@
+{
+  "domain": "html_artifacts",
+  "name": "HTML Artifacts",
+  "codeowners": ["@darkfiberiru"],
+  "config_flow": true,
+  "dependencies": ["http", "frontend", "panel_custom", "websocket_api"],
+  "documentation": "https://github.com/darkfiberiru/ha-html-artifact",
+  "integration_type": "service",
+  "iot_class": "calculated",
+  "issue_tracker": "https://github.com/darkfiberiru/ha-html-artifact/issues",
+  "requirements": [],
+  "version": "0.2.0"
+}
