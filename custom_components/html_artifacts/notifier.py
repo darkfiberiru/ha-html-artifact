@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from urllib.parse import quote
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
@@ -13,13 +14,15 @@ from .const import (
     CONF_NOTIFY_TARGETS,
     EVENT_FINISHED,
     EVENT_GATE,
+    EVENT_OVERTIME,
     EVENT_STEP,
+    PANEL_URL_PATH,
 )
 from .core import ArtifactStore
 
 _LOGGER = logging.getLogger(__name__)
 
-LIVE_CHANGES = {"start", "resume", "skip", "extend", "step", "pause", "gate", "answer"}
+LIVE_CHANGES = {"start", "resume", "skip", "extend", "step", "pause", "gate", "answer", "overtime"}
 CLEAR_CHANGES = {"reset", "delete", "finish"}
 
 
@@ -67,12 +70,24 @@ class TimerNotifier:
     def _tag(timer: dict) -> str:
         return f"htmlart_{timer['id']}"
 
-    async def _send(self, targets: list[str], title: str, message: str, data: dict[str, Any], notification_id: str) -> None:
+    @staticmethod
+    def _link(artifact_id: str | None) -> str | None:
+        """Where tapping a notification goes: the panel, already showing this artifact."""
+        return f"/{PANEL_URL_PATH}?artifact={quote(artifact_id, safe='')}" if artifact_id else None
+
+    async def _send(
+        self, targets: list[str], title: str, message: str, data: dict[str, Any], notification_id: str,
+        artifact_id: str | None = None,
+    ) -> None:
+        link = self._link(artifact_id)
+        if link:
+            data = {**data, "clickAction": link, "url": link}  # Android / iOS
         if not targets:
+            body = f"{message}\n\n[Open the page]({link})" if link else message
             await self._hass.services.async_call(
                 "persistent_notification",
                 "create",
-                {"title": title, "message": message, "notification_id": notification_id},
+                {"title": title, "message": body, "notification_id": notification_id},
                 blocking=False,
             )
             return
@@ -107,18 +122,21 @@ class TimerNotifier:
                 "phase": event.get("phase", "start"),
                 "missed": event.get("missed", 0),
             }
+            if kind == "overtime":
+                data.update(seconds_over=event.get("over", 0), reminder=event.get("reminder", False))
             if kind == "gate":
                 gate = (event.get("step") or {}).get("gate") or {}
                 data.update(question=gate.get("question"), options=gate.get("more", []))
             if kind == "finished":
                 data.update(
                     history=timer.get("history", []),
+                    step_log=timer.get("step_log", []),
                     planned=timer.get("planned_duration"),
                     started=timer.get("started_wall"),
                     finished=timer.get("finished_wall"),
                 )
             self._hass.bus.async_fire(
-                {"step": EVENT_STEP, "gate": EVENT_GATE, "finished": EVENT_FINISHED}[kind], data
+                {"step": EVENT_STEP, "gate": EVENT_GATE, "overtime": EVENT_OVERTIME, "finished": EVENT_FINISHED}[kind], data
             )
             if self._allowed(timer):
                 self._hass.async_create_task(self._alert(event))
@@ -149,6 +167,9 @@ class TimerNotifier:
         if event["kind"] == "gate":
             await self._gate_alert(event, prefix)
             return
+        if event["kind"] == "overtime":
+            await self._overtime_alert(event, prefix)
+            return
         if event["kind"] == "finished":
             message = (step or {}).get("label") or "Done"
             if step:
@@ -177,7 +198,23 @@ class TimerNotifier:
                 actions.append(_action(timer["id"], "next", "Next", track))
             actions.append(_action(timer["id"], "pause", "Pause", track))
             data["actions"] = actions
-        await self._send(self._targets(timer), timer["label"], message, data, f"{self._tag(timer)}_alert")
+        await self._send(self._targets(timer), timer["label"], message, data, f"{self._tag(timer)}_alert", timer["artifact_id"])
+
+    async def _overtime_alert(self, event: dict, prefix: str) -> None:
+        timer, step, track = event["timer"], event["step"], event.get("track")
+        if step.get("endLabel") and not event.get("reminder"):
+            return  # the end-of-activity alert already said so
+        message = prefix + (f"{step['label']}: +{_mmss(event.get('over'))} over" if event.get("reminder") else f"{step['label']}: time's up")
+        data = {
+            "tag": f"{self._tag(timer)}_alert",
+            "channel": "html_artifacts_alerts",
+            "importance": "high",
+            "priority": "high",
+            "ttl": 0,
+            "push": {"interruption-level": "time-sensitive"},
+            "actions": [_action(timer["id"], "next", "Next", track), _action(timer["id"], "extend", "+1 min", track)],
+        }
+        await self._send(self._targets(timer), timer["label"], message, data, f"{self._tag(timer)}_alert", timer["artifact_id"])
 
     async def _gate_alert(self, event: dict, prefix: str) -> None:
         timer, step, track, index = event["timer"], event["step"], event.get("track") or "main", event["index"]
@@ -200,7 +237,7 @@ class TimerNotifier:
             "actions": actions,
         }
         message = f"{prefix}{step['label']}: {gate.get('question', 'Done yet?')}"
-        await self._send(self._targets(timer), timer["label"], message, data, tag)
+        await self._send(self._targets(timer), timer["label"], message, data, tag, timer["artifact_id"])
 
     async def _close_gates(self, timer: dict, still_waiting: set[str]) -> None:
         open_tracks = self._open_gates.get(timer["id"], set())
@@ -241,6 +278,9 @@ class TimerNotifier:
             if lane["state"] == "waiting":
                 pieces.append(f"{lane['label']}: {cur}?")
                 continue
+            if lane.get("overtime", 0) > 0:
+                pieces.append(f"{lane['label']}: {cur} +{_mmss(lane['overtime'])} over")
+                continue
             seconds = lane["remaining"] if lane.get("remaining") is not None else lane.get("next_in")
             pieces.append(f"{lane['label']}: {cur} {_mmss(seconds)}" if seconds is not None else f"{lane['label']}: {cur}")
         join = timer.get("join")
@@ -265,8 +305,17 @@ class TimerNotifier:
         focus = self._focus(timer)
         waiting = bool(timer.get("waiting"))
         if timer["state"] == "running":
-            message = self._lane_text(timer) if multi else f"Now: {current}\nNext: {nxt}"
-            if timer.get("next_due") and not (waiting and timer["next_index"] is None):
+            over = timer.get("overtime", 0)
+            if multi:
+                message = self._lane_text(timer)
+            elif over > 0:
+                message = f"{current}  +{_mmss(over)} over\nNext: {nxt}"
+            else:
+                message = f"Now: {current}\nNext: {nxt}"
+            if over > 0:
+                data["chronometer"] = True  # `when` in the past: counts UP from the moment time ran out
+                data["when"] = int(timer["server_now"] - over)
+            elif timer.get("next_due") and not (waiting and timer["next_index"] is None):
                 data["chronometer"] = True  # counts down to `when`
                 data["when"] = int(timer["next_due"])
             actions = []
@@ -278,7 +327,7 @@ class TimerNotifier:
         else:
             message = f"Paused: {self._lane_text(timer)}" if multi else f"Paused at: {current}"
             data["actions"] = [_action(timer["id"], "resume", "Resume")]
-        await self._send(self._targets(timer), timer["label"], message, data, f"{self._tag(timer)}_live")
+        await self._send(self._targets(timer), timer["label"], message, data, f"{self._tag(timer)}_live", timer["artifact_id"])
 
     async def _clear_tag(self, timer: dict, tag: str) -> None:
         for target in self._targets(timer):
@@ -305,4 +354,4 @@ class TimerNotifier:
         """A one-off notification requested by an artifact page."""
         pseudo = {"id": f"custom_{artifact_id}", "artifact_id": artifact_id}
         data = {"tag": f"htmlart_custom_{artifact_id}", "channel": "html_artifacts_alerts"}
-        await self._send(self._targets(pseudo), title or artifact_id, message, data, f"htmlart_custom_{artifact_id}")
+        await self._send(self._targets(pseudo), title or artifact_id, message, data, f"htmlart_custom_{artifact_id}", artifact_id)

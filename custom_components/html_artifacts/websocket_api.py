@@ -178,6 +178,8 @@ def ws_timers_list(rt, connection, msg):
         vol.Optional("start"): bool,
         vol.Optional("notify_targets"): vol.Any([str], None),
         vol.Optional("tracks"): vol.Any([vol.Any(dict, str)], None),
+        vol.Optional("advance"): vol.Any(vol.In(["auto", "manual"]), None),
+        vol.Optional("remind_every"): vol.Any(int, float, None),
     },
 )
 def ws_timers_create(rt, connection, msg):
@@ -191,6 +193,8 @@ def ws_timers_create(rt, connection, msg):
         msg.get("notify_targets"),
         bool(msg.get("start")),
         tracks=msg.get("tracks"),
+        advance=msg.get("advance"),
+        remind_every=msg.get("remind_every"),
     )
     return {"timer": timer}
 

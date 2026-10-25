@@ -157,14 +157,18 @@
         const adj = live ? dt : 0;
         const waiting = l.waiting != null;
         const base = l.current_index >= 0 ? steps[l.current_index] : null;
-        const remaining = l.remaining == null ? null : Math.max(0, l.remaining - adj);
+        // A manual step keeps counting below zero (overtime); other countdowns stop at 0.
+        const remaining = l.remaining == null ? null : l.manual ? l.remaining - adj : Math.max(0, l.remaining - adj);
+        const overtime = l.manual && remaining != null ? Math.max(0, -remaining) : 0;
         return {
           id: l.id,
           label: l.label,
           state: l.state,
           offset: l.offset,
           currentIndex: l.current_index,
-          current: base ? Object.assign({}, base, { remaining, waiting, track: l.id }) : null,
+          current: base ? Object.assign({}, base, { remaining, waiting, track: l.id, overtime, manual: !!l.manual }) : null,
+          overtime,
+          manual: !!l.manual,
           nextIndex: l.next_index == null ? -1 : l.next_index,
           next: l.next_index == null ? null : steps[l.next_index],
           nextKind: l.next_kind || null,
@@ -177,7 +181,7 @@
       };
       const lanes = (t.tracks || []).map(laneView);
       const join = t.join ? laneView(t.join) : null;
-      const hasExtras = !!(t.multi || steps.some((s) => s.gate || s.duration || s.after));
+      const hasExtras = !!(t.multi || t.advance === "manual" || steps.some((s) => s.gate || s.duration || s.after || s.advance));
       let top;
       if (!hasExtras) {
         // A plain flat timer: derive everything from the clock, as it always has.
@@ -196,6 +200,7 @@
           nextIndex: nxt,
           next: nxt >= 0 ? steps[nxt] : null,
           nextIn: Math.max(0, nextAt - elapsed),
+          overtime: 0,
         };
       } else {
         const waitingAny = (t.waiting || []).length > 0;
@@ -206,6 +211,7 @@
         top = {
           elapsed: t.elapsed_now + dt,
           remaining: Math.max(0, t.remaining - (running && !waitingAny ? dt : 0)),
+          overtime: Math.max(0, ...all.map((l) => l.overtime || 0)),
           currentIndex: t.current_index,
           current: t.current_index >= 0 ? (owner && owner.current) || steps[t.current_index] : null,
           nextIndex: t.next_index == null ? -1 : t.next_index,
@@ -721,6 +727,8 @@
               start: !!p.start,
               notify_targets: p.notify_targets,
               tracks: p.tracks,
+              advance: p.advance,
+              remind_every: p.remindEvery,
             })
           ).timer;
         case "timer.control":
@@ -954,6 +962,11 @@
     disconnectedCallback() {
       if (this._unsub) this._unsub();
       this._unsub = null;
+      if (this._onLocation) {
+        window.removeEventListener("location-changed", this._onLocation);
+        window.removeEventListener("popstate", this._onLocation);
+        this._onLocation = null;
+      }
       if (this._runner) this._runner.destroy();
       this._runner = null;
       this._started = false;
@@ -1034,15 +1047,39 @@
         this._unsub = await this._hass.connection.subscribeMessage((ev) => this._onEvent(ev), {
           type: WS + "subscribe",
         });
-        const last = localStorage.getItem(LS_LAST);
-        const first = this._list.find((a) => a.id === last) || this._list[0];
-        if (first) {
-          await this._open(first.id);
-          this._setMode("view");
+        // A phone notification opens /html-artifacts?artifact=<id>: show that page straight away.
+        this._onLocation = () => this._openLinked();
+        window.addEventListener("location-changed", this._onLocation);
+        window.addEventListener("popstate", this._onLocation);
+        if (!(await this._openLinked())) {
+          const last = localStorage.getItem(LS_LAST);
+          const first = this._list.find((a) => a.id === last) || this._list[0];
+          if (first) {
+            await this._open(first.id);
+            this._setMode("view");
+          }
         }
       } catch (err) {
         this._toast("Could not load artifacts: " + (err.message || err.code));
       }
+    }
+
+    async _openLinked() {
+      let id = null;
+      try {
+        id = new URLSearchParams(window.location.search).get("artifact");
+      } catch (e) {
+        /* no location in odd embeds */
+      }
+      if (!id || (this._cur && this._cur.id === id && this._mode === "view")) return !!id;
+      if (!this._list.some((a) => a.id === id)) {
+        this._list = (await this._ws("list")).artifacts;
+        this._renderList();
+      }
+      if (!this._list.some((a) => a.id === id)) return false;
+      await this._open(id);
+      this._setMode("view");
+      return true;
     }
 
     _renderList() {
@@ -1500,7 +1537,7 @@
         return {
           id: "dry-run", artifact_id: art.id, label: (p && p.label) || "", state: "idle",
           duration: (p && p.duration) || 0, steps: (p && p.steps) || [], elapsed_now: 0, notify_targets: [],
-          remaining: 0, current_index: -1, next_index: null, next_in: 0, multi: false, tracks: [], join: null, waiting: [], history: [],
+          remaining: 0, current_index: -1, next_index: null, next_in: 0, multi: false, tracks: [], join: null, waiting: [], history: [], overtime: 0, step_log: [],
         };
       default:
         return null;

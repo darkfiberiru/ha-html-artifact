@@ -93,6 +93,16 @@ window.ha API (all methods return promises unless noted)
       more?: [60,120], autoYesAfter?: 600}}. The lane pauses and the step stays current
       (view.current.waiting) until ha.timers.answer(id, stepIndex, "yes" | seconds). The phone
       shows the question with Done / +1 min / +2 min; +N pushes the lane back and asks again.
+  Manual advance ("cook until I say"): create({advance:"manual", steps:[...]}) or per step
+      {advance:"manual"|"auto", remindEvery?: seconds}. When a manual step's time is up the timer
+      does NOT move on: it stays on that step and counts overtime (current.remaining goes
+      negative, view.overtime > 0; show "+1:23 over"). Next (skip) ends it and every later step
+      shifts to when Next was pressed (pressing early pulls them sooner); extend() in overtime
+      gives the step more time first. An explicit advance:"auto" step after a manual one is a
+      reminder: it fires on time and never ends the manual step. Only the step's own lane holds.
+      timer.step_log = [{index, track, label, planned, actual}] for every Next. reset() and
+      start() restore the schedule as created (extends and overtime shifts are undone).
+      Bus event html_artifacts_timer_overtime {step, seconds_over, reminder}.
   ha.timers.fromDurations([{label, seconds, detail?, track?}])  (sync) -> {steps, duration}
       (emits `duration` on each step, so the countdown shows time left in each step)
   ha.timers.list(), start(id), pause(id[, {track}]), resume(id[, {track}]), reset(id),
@@ -448,7 +458,10 @@ class TimerCreateTool(_Tool):
         "fires when those lanes are finished. A step duration makes it an activity "
         "('Simmer, 9:40 left'; endLabel announces its end). gate = {question, yes?, more?: "
         "[60,120], autoYesAfter?} pauses that lane until the phone/page answers (cook until "
-        "done). Phone notifications need the artifact's 'notify' capability to be approved."
+        "done). advance='manual' (timer default, or per step; explicit 'auto' steps then act as "
+        "reminders) makes a step WAIT for Next when its time is up: it counts overtime (negative "
+        "remaining) and later steps shift to when Next is pressed; remind_every re-alerts while over. "
+        "Phone notifications need the artifact's 'notify' capability to be approved."
     )
     parameters = vol.Schema(
         {
@@ -456,6 +469,8 @@ class TimerCreateTool(_Tool):
             vol.Required("label"): str,
             vol.Optional("steps"): [dict],
             vol.Optional("tracks"): [vol.Any(dict, str)],
+            vol.Optional("advance"): vol.In(["auto", "manual"]),
+            vol.Optional("remind_every"): vol.Coerce(float),
             vol.Optional("duration"): vol.Coerce(float),
             vol.Optional("start"): bool,
         }
@@ -470,6 +485,7 @@ class TimerCreateTool(_Tool):
         timer = rt.timers.create(
             args["artifact_id"], args["label"], args.get("steps"), args.get("duration"),
             None, bool(args.get("start")), tracks=args.get("tracks"),
+            advance=args.get("advance"), remind_every=args.get("remind_every"),
         )
         return {"timer": timer}
 

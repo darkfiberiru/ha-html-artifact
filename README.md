@@ -172,6 +172,13 @@ need to agree. The full reference Claude reads is `AUTHORING_GUIDE` in `llm_api.
 - **Gates.** `gate: {question, yes, more: [60,120], autoYesAfter}` pauses that lane until answered, from the page
   (`ha.timers.answer`) or the phone (**Done / +1 min / +2 min**). A "+N" pushes the lane back N seconds and asks again.
   `view.current.waiting` is true meanwhile, and `html_artifacts_timer_gate` fires on the bus.
+- **Manual advance.** `advance: "manual"` (timer-wide default, or per step) makes a step wait for you. When its time is
+  up the timer stays on it and counts **overtime**: `view.current.remaining` goes negative and `view.overtime` is
+  positive (render `+1:23 over`). **Next** ends the step and shifts every later step to when you pressed it (pressing
+  early pulls them sooner); `+1 min` during overtime gives the step more time. `remindEvery` re-alerts while over.
+  An explicit `advance: "auto"` step after a manual one is a reminder: it fires on time and never ends the manual step.
+  Only that step's lane waits. `timer.step_log` records planned vs actual per Next; `reset`/`start` restore the original
+  schedule; `html_artifacts_timer_overtime` fires for automations.
 - **History.** `timer.history` records every start, pause, resume, extend, skip and answer (time, lane, step, source) and
   finished timers are kept for 7 days, so a page can log "planned 27 min, took 31". `html_artifacts_timer_finished`
   carries the history for automations.
@@ -189,6 +196,8 @@ consistently for everyone. For artifacts with the **notify** permission granted:
   the numbers as of the last update; the native countdown follows the soonest event), lane-named alerts
   (`Rice — Rice ready`), and **+1 min / Next / Pause** buttons that act on the lane that just fired. A gate shows its
   question with **Done / +1 min / +2 min** until answered.
+
+Tapping any notification opens the panel on that artifact (`/html-artifacts?artifact=<id>`). The live notification counts **up** during overtime.
 
 Notifications go to the services chosen under **Configure**, or a persistent notification if none.
 

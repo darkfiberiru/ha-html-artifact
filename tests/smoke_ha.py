@@ -215,6 +215,31 @@ async def main():
     ok("tapping +1 min on the gate extends that lane and clears the question")
     timers.control(lane_id, "delete")
 
+    # --- manual advance: overtime on the phone, and every notification opens the artifact ------
+    sent.clear()
+    bus_events.clear()
+    hass.bus.async_listen("html_artifacts_timer_overtime", lambda e: bus_events.append(("overtime", dict(e.data))))
+    r = await ws("timers/create", artifact_id="pesto", label="Simmer test", advance="manual", start=True, remind_every=10,
+                 steps=[{"at": 0, "label": "Start", "advance": "auto"}, {"at": 0.6, "label": "Simmer"}, {"at": 1.0, "label": "Serve"}, {"at": 1.4, "label": "Eat"}])
+    assert r["success"], r
+    mid = r["result"]["timer"]["id"]
+    await asyncio.sleep(2.0)
+    view = timers.get_view(mid)
+    assert view["state"] == "running" and view["overtime"] > 0, view
+    over_alerts = [x for x in sent if "time's up" in x["message"]]
+    assert over_alerts, [x["message"] for x in sent]
+    assert [a["title"] for a in over_alerts[0]["data"]["actions"]] == ["Next", "+1 min"]
+    live = [x for x in sent if x["data"].get("tag") == f"htmlart_{mid}" and "over" in x["message"]]
+    assert live and live[-1]["data"]["chronometer"] and live[-1]["data"]["when"] <= int(time.time()), live
+    assert all(x["data"].get("clickAction") == "/html-artifacts?artifact=pesto" and x["data"].get("url") == "/html-artifacts?artifact=pesto"
+               for x in sent if x["message"] != "clear_notification"), [x["data"] for x in sent]
+    assert any(k == "overtime" for k, _ in bus_events), bus_events
+    assert handle_notification_action(timers, over_alerts[0]["data"]["actions"][0]["action"])
+    view = timers.get_view(mid)
+    assert view["overtime"] == 0 and view["step_log"] and view["step_log"][0]["label"] == "Simmer", view
+    timers.control(mid, "delete")
+    ok("manual advance: time's-up alert with Next / +1 min, counting-up notification, tap opens the artifact")
+
     # timers cannot be driven through another artifact
     await ws("save", artifact_id="other", html="x")
     r = await ws("timers/control", artifact_id="other", timer_id=tid, action="reset")

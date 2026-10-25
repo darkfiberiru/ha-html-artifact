@@ -192,6 +192,22 @@ with sync_playwright() as pw:
     page.evaluate("ed.setConfig({artifact: 'gone'})")
     check("not found" in page.evaluate("ed.shadowRoot.getElementById('art').selectedOptions[0].textContent"), "a deleted artifact is shown as not found")
 
+    # a phone notification opens /html-artifacts?artifact=<id>: that page is shown straight away
+    dl = browser.new_page(viewport={"width": 900, "height": 700})
+    dl.route("http://harness.test/**", lambda route: route.fulfill(status=200, content_type="text/html", body=html))
+    dl.goto("http://harness.test/?artifact=board")
+    dl.evaluate("mountPanel(false)")
+    dl.wait_for_timeout(700)
+    check(dl.evaluate("panel._cur && panel._cur.id") == "board", "deep link ?artifact=board opens that artifact")
+    check(dl.evaluate("panel.shadowRoot.querySelector('.app').dataset.mode") == "view", "deep link shows the page full size")
+    dl.evaluate("history.pushState({}, '', '/?artifact=recipe'); window.dispatchEvent(new Event('location-changed'))")
+    dl.wait_for_timeout(500)
+    check(dl.evaluate("panel._cur.id") == "recipe", "a second notification tap switches to its artifact")
+    dl.evaluate("history.pushState({}, '', '/?artifact=nope'); window.dispatchEvent(new Event('location-changed'))")
+    dl.wait_for_timeout(300)
+    check(dl.evaluate("panel._cur.id") == "recipe", "an unknown artifact in the link leaves the current page alone")
+    dl.close()
+
     check(page.evaluate("customElements.get('html-artifact-card').getConfigElement().tagName.toLowerCase()") == "html-artifact-card-editor", "card offers the visual editor")
     check(page.evaluate("customElements.get('html-artifact-card').getStubConfig(hass)") == {"artifact": "recipe", "height": 500}, "new cards start with the first artifact selected")
     page.evaluate("""() => {
