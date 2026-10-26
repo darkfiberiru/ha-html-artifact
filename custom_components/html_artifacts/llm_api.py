@@ -40,6 +40,9 @@ WORKFLOW
    prefer artifact_patch with find/replace edits (old_str must match exactly once;
    all edits apply or none do) and base_version set to the version you read: you
    resend only what changed. Use artifact_publish with the full html for rewrites.
+   A page too big to send comfortably (say over 50 KB) never needs to pass through
+   the conversation: upload it as an asset with artifact_assets_upload_url
+   (path "page.html"), then artifact_publish with html_asset="page.html".
    If the user edited the page in the meantime you get error "conflict" with the
    current html: re-read, merge their changes into yours and try again. Never
    overwrite blindly.
@@ -141,7 +144,7 @@ window.ha API (all methods return promises unless noted)
 
 ASSET FILES (per artifact, on the HA server, not versioned)
   Paths: letters, digits, . _ - and "/" folders, e.g. "img/plan.webp",
-  "models/base.stl". Allowed types: images, audio/video, json/txt/csv/md/css/js,
+  "models/base.stl". Allowed types: images, audio/video, json/txt/csv/md/css/js, html,
   fonts, pdf, stl/obj/glb/gltf/3mf/bin. Limits: 8 MB per file, 64 MB and 1000
   files per artifact. Publish the page first; assets belong to an existing artifact.
   Uploading, cheapest first:
@@ -252,12 +255,17 @@ class PublishTool(_Tool):
         "For an existing artifact pass base_version from artifact_read; a stale version "
         "returns a 'conflict' error with the current html to merge. 'capabilities' "
         "declares what the page needs: {entities: [patterns], services: [domain.service "
-        "patterns], notify: bool, network: bool}; the user must approve them."
+        "patterns], notify: bool, network: bool}; the user must approve them. "
+        "Instead of 'html' you can pass 'html_asset': the path of an .html asset file of this "
+        "artifact (upload it first with artifact_assets_upload_url), so a large page never "
+        "passes through the conversation; the asset is removed after publishing unless keep_asset=true."
     )
     parameters = vol.Schema(
         {
             vol.Required("artifact_id"): str,
-            vol.Required("html"): str,
+            vol.Optional("html"): str,
+            vol.Optional("html_asset"): str,
+            vol.Optional("keep_asset"): bool,
             vol.Optional("base_version"): int,
             vol.Optional("title"): str,
             vol.Optional("description"): str,
@@ -269,9 +277,23 @@ class PublishTool(_Tool):
     @_guard
     async def async_call(self, hass, tool_input, llm_context) -> JsonObjectType:
         args = tool_input.tool_args
-        result = _rt(hass).artifacts.save(
+        rt = _rt(hass)
+        asset_path = args.get("html_asset")
+        if ("html" in args) == bool(asset_path):
+            raise ArtifactError("invalid", "pass exactly one of html or html_asset")
+        if asset_path:
+            if not asset_path.lower().endswith(".html"):
+                raise ArtifactError("invalid", "html_asset must be an .html asset file")
+            data, _meta = await rt.async_assets(rt.assets.read, args["artifact_id"], asset_path)
+            try:
+                html = data.decode("utf-8")
+            except UnicodeDecodeError as err:
+                raise ArtifactError("invalid", f"html_asset is not UTF-8 text: {err}") from err
+        else:
+            html = args["html"]
+        result = rt.artifacts.save(
             args["artifact_id"],
-            args["html"],
+            html,
             title=args.get("title"),
             description=args.get("description"),
             icon=args.get("icon"),
@@ -281,7 +303,12 @@ class PublishTool(_Tool):
             updated_by="claude",
         )
         out = {k: v for k, v in result.items() if k != "html"}
-        out["lint"] = lint_html(args["html"], out.get("caps_requested"))
+        if asset_path:
+            out["from_asset"] = asset_path
+            if not args.get("keep_asset"):
+                await rt.async_assets(rt.assets.delete, args["artifact_id"], asset_path)
+                out["asset_removed"] = True
+        out["lint"] = lint_html(html, out.get("caps_requested"))
         out["next"] = "Call artifact_check to see how it renders in a real browser."
         return out
 

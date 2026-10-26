@@ -482,6 +482,38 @@ async def main():
     assert "signed/big.bin" in [f["path"] for f in files] and "one.txt" not in [f["path"] for f in files]
     ok("signed upload URL: zip PUT without auth, single use, sha256 checked, needs path or zip")
 
+    # --- publish a page from an uploaded .html asset ------------------------------------
+    cur = (await tool("artifact_read", artifact_id="cook"))["version"]
+    page = "<!doctype html><title>Big</title><p>" + "é" * 60000 + "</p>"
+    res = await tool("artifact_assets_upload_url", artifact_id="cook", path="page.html")
+    resp = await up.put(AReq(page.encode()), res["path"].rsplit("/", 1)[1])
+    assert resp.status == 200, resp.body
+    res = await tool("artifact_publish", artifact_id="cook", html_asset="page.html")
+    assert res["error"] == "conflict", res  # base_version still guards a page built elsewhere
+    res = await tool("artifact_publish", artifact_id="cook", html_asset="page.html", base_version=cur)
+    assert res["version"] == cur + 1 and res["asset_removed"] and "html" not in res, res
+    assert (await tool("artifact_read", artifact_id="cook"))["html"] == page
+    assert "page.html" not in [f["path"] for f in (await tool("artifact_assets_list", artifact_id="cook"))["files"]]
+    res = await tool("artifact_publish", artifact_id="cook", html_asset="page.html", base_version=cur + 1)
+    assert res["error"] == "not_found", res
+    res = await tool("artifact_publish", artifact_id="cook", html="<p>x</p>", html_asset="page.html", base_version=cur + 1)
+    assert res["error"] == "invalid", res
+    res = await tool("artifact_publish", artifact_id="cook", base_version=cur + 1)
+    assert res["error"] == "invalid", res
+    res = await tool("artifact_publish", artifact_id="cook", html_asset="signed/big.bin", base_version=cur + 1)
+    assert res["error"] == "invalid", res
+    await tool("artifact_asset_put", artifact_id="cook", path="bad.html", data_base64=base64.b64encode(b"\xff\xfe").decode())
+    res = await tool("artifact_publish", artifact_id="cook", html_asset="bad.html", base_version=cur + 1)
+    assert res["error"] == "invalid" and "UTF-8" in res["message"], res
+    res = await tool("artifact_assets_upload_url", artifact_id="cook", path="keep.html")
+    await up.put(AReq(b"<p>kept</p>"), res["path"].rsplit("/", 1)[1])
+    res = await tool("artifact_publish", artifact_id="cook", html_asset="keep.html", keep_asset=True, base_version=cur + 1)
+    assert res["version"] == cur + 2 and "asset_removed" not in res, res
+    assert "keep.html" in [f["path"] for f in (await tool("artifact_assets_list", artifact_id="cook"))["files"]]
+    for junk in ("keep.html", "bad.html"):
+        await tool("artifact_asset_delete", artifact_id="cook", path=junk)
+    ok("artifact_publish html_asset: page from a signed-URL upload, base_version conflict, asset removed or kept, bad input refused")
+
     # --- REST views ----------------------------------------------------------------------
     class Req(dict):
         def __init__(self, body=None, admin=True, query=None):

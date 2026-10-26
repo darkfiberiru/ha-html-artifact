@@ -43,7 +43,7 @@ update, with release notes and an **Install** button. After installing, restart 
 - **What counts as a new version:** the latest GitHub *release* if there is one, otherwise the `version` in
   `manifest.json` on the default branch. To ship an update, bump `version` in both `manifest.json` and `const.py`
   (a test fails if they differ) and push; optionally tag a release for release notes.
-- **With HACS**, versions come from GitHub *releases*, not from `manifest.json`. There are no releases yet, so HACS shows the latest commit hash instead of `0.7.0` until you publish one (Releases > Draft a new release, tag `v0.7.0`). Each later bump needs a new release for HACS to offer it as an update.
+- **With HACS**, versions come from GitHub *releases*, not from `manifest.json`. There are no releases yet, so HACS shows the latest commit hash instead of `0.8.0` until you publish one (Releases > Draft a new release, tag `v0.8.0`). Each later bump needs a new release for HACS to offer it as an update.
 - **HACS wins.** If HACS lists this repo as installed, the built-in updater doesn't create its entity (and removes an old one) so the two never disagree. Tick *Use the built-in updater even when HACS manages this integration* under **Configure** to override; it applies after a restart.
 - **Checked every 6 hours**, or run *Check for updates* on the entity.
 - Installing swaps `custom_components/html_artifacts` as a unit: the new copy is unpacked and validated first, and the old one is put back if the swap fails.
@@ -94,7 +94,7 @@ photos, 3D models, data) goes in the artifact's **asset files** instead:
   Deleted with the artifact. Never served from `/local`: the page gets them through the panel's
   authenticated bridge, so they work with the default no-network policy and need no permission.
 - Limits: 8 MB per file, 64 MB and 1000 files per artifact. Paths like `img/plan.webp`, `models/base.stl`;
-  allowed types are images, audio/video, json/txt/csv/md/css/js, fonts, pdf, stl/obj/glb/gltf/3mf/bin.
+  allowed types are images, audio/video, json/txt/csv/md/css/js/html, fonts, pdf, stl/obj/glb/gltf/3mf/bin.
 - In the page: `await ha.assets.get("models/base.stl")` (ArrayBuffer; or `"text"`, `"json"`, `"blob"`),
   `img.src = await ha.assets.url("img/plan.webp")`, `await ha.assets.list()`.
 
@@ -110,6 +110,11 @@ Getting files in, cheapest first (MCP):
 2. `artifact_assets_import` with an `http(s)` URL of a zip that Home Assistant can reach (a LAN address is fine).
 3. `artifact_asset_put` with base64, in chunks with `offset` and `final`, optionally checked with `sha256`.
    Every byte goes through Claude's context, so it suits small files.
+
+**Large pages:** the page HTML itself can take the same route. Upload it with a signed URL as an asset
+(`artifact_assets_upload_url` with `path: "page.html"`), then `artifact_publish` with `html_asset: "page.html"`
+instead of `html` (`base_version` and conflicts work as usual). The asset is removed after publishing unless
+`keep_asset: true`, so a 200 KB page never has to be typed out through the conversation.
 
 Every zip member is checked before anything is written (plain relative paths, allowed types, no links,
 size/count limits, no zip bombs). Over REST: `PUT /api/html_artifacts/<id>/assets/<path>` with the raw file,
@@ -254,8 +259,8 @@ shared by the household.
 ## Development and what has been verified
 
 ```bash
-python -m unittest discover -s tests -v               # core logic, updater, patch/lint/reports; no HA needed (57 tests)
-node tests/frontend_check.js                          # bridge protocol, CSP, error capture, line mapping, dry-run stubs (19 checks)
+python -m unittest discover -s tests -v               # core logic, updater, patch/lint/reports; no HA needed (107 tests)
+node tests/frontend_check.js                          # bridge protocol, CSP, error capture, line mapping, dry-run stubs (20 checks)
 NODE_PATH=<jsdom>/node_modules node tests/example_pages.js   # example pages in jsdom through the real bridge
 <venv-with-homeassistant>/bin/python tests/smoke_ha.py        # real HA 2026.2: websocket, MCP tools, REST, notifications
 <venv-with-homeassistant>/bin/python tests/smoke_update.py    # real HA: update entity (GitHub faked)

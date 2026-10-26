@@ -169,6 +169,21 @@ async def main():
     assert code == 200 and body == mb
     ok("authenticated REST PUT of a 5 MB file round-trips byte for byte")
 
+    # 6. a 250 KB page pushed with curl and published from the asset, never through the tool call
+    page = "<!doctype html><title>Big page</title>" + "".join(f"<p>row {i} ✓</p>" for i in range(14000))
+    pf = tmp.with_name("page.html")
+    pf.write_text(page, encoding="utf-8")
+    assert pf.stat().st_size > 250_000
+    res = await tool("artifact_assets_upload_url", artifact_id="vent", path="page.html",
+                     sha256=hashlib.sha256(pf.read_bytes()).hexdigest())
+    code, body = await curl("-X", "PUT", "--data-binary", f"@{pf}", res["urls"][0])
+    assert code == 200, (code, body[:200])
+    cur = (await tool("artifact_read", artifact_id="vent", metadata_only=True))["version"]
+    res = await tool("artifact_publish", artifact_id="vent", html_asset="page.html", base_version=cur)
+    assert res.get("version") == cur + 1 and res.get("asset_removed"), res
+    assert (await tool("artifact_read", artifact_id="vent"))["html"] == page
+    ok(f"curl PUT of a {pf.stat().st_size / 1e3:.0f} KB page, then artifact_publish(html_asset): stored byte for byte")
+
     await hass.async_stop(force=True)
     print(f"\n{len(PASSED)} live HTTP checks passed against a real Home Assistant http server")
 
