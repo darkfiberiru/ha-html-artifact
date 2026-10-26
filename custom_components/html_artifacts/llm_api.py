@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import functools
 
 import aiohttp
 import voluptuous as vol
@@ -190,18 +191,45 @@ def _rt(hass: HomeAssistant):
     return rt
 
 
+# llm.ToolResult does not exist on the older cores hacs.json still claims
+# support for, so resolve it once and fall back to the plain-dict contract
+# there rather than raising at import time.
+_ToolResult = getattr(llm, "ToolResult", None)
+
+
 def _guard(func):
-    async def wrapper(self, hass, tool_input, llm_context) -> JsonObjectType:
+    """Turn ArtifactError into a tool error, and return HA's ToolResult.
+
+    Both concerns live here so every tool body stays a plain function that
+    returns a dict:
+
+    * Returning a bare dict from a tool is deprecated and stops working in HA
+      2027.11 -- llm.APIInstance.async_call_tool wraps it and logs the usage.
+      Wrapping it ourselves keeps the log clean and the behaviour identical.
+    * An ArtifactError is an expected outcome (conflict, bad input), not a
+      crash, so it comes back as a result flagged error=True.
+    """
+
+    @functools.wraps(func)
+    async def wrapper(self, hass, tool_input, llm_context):
         try:
-            return await func(self, hass, tool_input, llm_context)
+            result = await func(self, hass, tool_input, llm_context)
         except ArtifactError as err:
-            return {"error": err.code, "message": err.message, **err.extra}
+            payload = {"error": err.code, "message": err.message, **err.extra}
+            return _ToolResult(data=payload, error=True) if _ToolResult else payload
+        if _ToolResult is None or isinstance(result, _ToolResult):
+            return result
+        return _ToolResult(data=result)
 
     return wrapper
 
 
 class _Tool(llm.Tool):
-    pass
+    # Set once for every tool in this module. Without it,
+    # llm.APIInstance.__post_init__ reports each tool as "provided without an
+    # integration", which becomes an error in HA 2027.10. Harmless on cores
+    # that predate the attribute.
+    integration = DOMAIN
 
 
 class GuideTool(_Tool):
@@ -209,6 +237,7 @@ class GuideTool(_Tool):
     description = "Read this first: how to write HTML artifacts and the window.ha API they can use."
     parameters = vol.Schema({})
 
+    @_guard
     async def async_call(self, hass, tool_input, llm_context) -> JsonObjectType:
         return {"guide": AUTHORING_GUIDE}
 
