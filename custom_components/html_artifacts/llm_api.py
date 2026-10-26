@@ -375,7 +375,8 @@ class PatchTool(_Tool):
     name = "artifact_patch"
     description = (
         "Change an existing artifact with find/replace edits instead of resending the whole page. "
-        "edits = [{old_str, new_str}] (old/new also work) applied in order; each old_str must appear EXACTLY once in "
+        "edits = [{old_str, new_str}] (old/new also work) applied in order (omit edits to change only title, "
+        "description, icon, display or card_height); each old_str must appear EXACTLY once in "
         "the page (add surrounding text to make it unique); all edits apply or none do. "
         "base_version is required: the version you read (artifact_read, metadata_only is fine). "
         "A stale version returns a 'conflict' with the current html. Returns the new version, "
@@ -385,7 +386,7 @@ class PatchTool(_Tool):
         {
             vol.Required("artifact_id"): str,
             vol.Required("base_version"): int,
-            vol.Required("edits"): [
+            vol.Optional("edits"): [
                 vol.Schema(
                     {
                         vol.Optional("old_str"): str,
@@ -409,7 +410,7 @@ class PatchTool(_Tool):
         args = tool_input.tool_args
         store = _rt(hass).artifacts
         edits = []
-        for edit in args["edits"]:
+        for edit in args.get("edits") or []:
             old = edit.get("old_str", edit.get("old"))
             new = edit.get("new_str", edit.get("new"))
             if old is None or new is None:

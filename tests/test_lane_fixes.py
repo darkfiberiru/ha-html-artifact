@@ -198,5 +198,74 @@ class ExtraTimeTest(unittest.TestCase):
         self.assertEqual(engine.get_view(timer["id"])["extra"], [])
 
 
+class SameTimeAsGateTest(unittest.TestCase):
+    def make(self, lemon_at=2):
+        engine, sched, _, events = make_engine()
+        steps = [
+            {"track": "a", "at": 0, "label": "Bake", "advance": "auto", "duration": 2},
+            {"track": "a", "at": 2, "label": "Check", "gate": {"question": "145?", "yes": "Done", "more": [60]}},
+            {"track": "a", "at": lemon_at, "label": "Lemon butter", "advance": "manual", "duration": 2},
+            {"track": "*", "label": "Serve"},
+        ]
+        timer = engine.create("a", "x", steps, tracks=[{"id": "a"}], start=True)
+        return engine, sched, events, timer["id"]
+
+    def test_plus_n_keeps_a_same_time_step_behind_the_check(self):
+        engine, sched, events, tid = self.make()
+        sched.advance(5)
+        self.assertEqual(lane(engine.get_view(tid), "a")["waiting"], 1)
+        engine.answer(tid, 1, 60)
+        view = engine.get_view(tid)
+        self.assertEqual(lane(view, "a")["current_index"], 1)
+        self.assertNotIn("Lemon butter", [e["step"]["label"] for e in fired(events, "step")])
+        sched.advance(61)  # asked again at +60
+        self.assertEqual(lane(engine.get_view(tid), "a")["waiting"], 1)
+        self.assertEqual(len(fired(events, "gate")), 2)
+        engine.answer(tid, 1, "yes")
+        view = engine.get_view(tid)
+        self.assertEqual(lane(view, "a")["current_index"], 2)
+        self.assertEqual(view["state"], "running")  # Lemon butter holds
+
+    def test_a_step_one_second_later_still_works(self):
+        engine, sched, events, tid = self.make(lemon_at=3)
+        sched.advance(5)
+        engine.answer(tid, 1, 60)
+        self.assertEqual(lane(engine.get_view(tid), "a")["current_index"], 1)
+        sched.advance(61)
+        engine.answer(tid, 1, "yes")
+        self.assertEqual(lane(engine.get_view(tid), "a")["current_index"], 1)  # the step was 1 s after the check
+        sched.advance(2)
+        self.assertEqual(lane(engine.get_view(tid), "a")["current_index"], 2)
+
+    def test_yes_lets_the_same_time_step_start(self):
+        engine, sched, events, tid = self.make()
+        sched.advance(5)
+        engine.answer(tid, 1, "yes")
+        self.assertEqual(lane(engine.get_view(tid), "a")["current_index"], 2)
+
+    def test_extend_while_asked_also_keeps_it_behind(self):
+        engine, sched, events, tid = self.make()
+        sched.advance(5)
+        engine.extend(tid, 30, track="a")
+        engine.answer(tid, 1, "yes")
+        self.assertEqual(lane(engine.get_view(tid), "a")["current_index"], 1)
+        sched.advance(31)
+        self.assertEqual(lane(engine.get_view(tid), "a")["current_index"], 2)
+
+
+class MetadataOnlyPatchTest(unittest.TestCase):
+    def test_empty_edits_with_metadata_changes_no_html(self):
+        from tests.test_core import make_store
+        store = make_store()[0]
+        a = store.save("a", "<p>x</p>", source="claude")
+        b = store.patch("a", [], base_version=a["version"], display="card", card_height=300, source="claude")
+        self.assertEqual((b["version"], b["display"], b["card_height"], b["html"]), (1, "card", 300, "<p>x</p>"))
+        c = store.patch("a", None, base_version=1, title="New", source="claude")
+        self.assertEqual((c["title"], c["version"]), ("New", 2))
+        import tests.test_core as tc
+        with self.assertRaises(tc.core.ArtifactError):
+            store.patch("a", [], base_version=2, source="claude")  # nothing to do
+
+
 if __name__ == "__main__":
     unittest.main()

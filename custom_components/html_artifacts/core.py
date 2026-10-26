@@ -573,7 +573,10 @@ class ArtifactStore(_Listeners):
                 f"{current['updated_by']}); your edits are based on {base_version}",
                 current=self.get(artifact_id),
             )
-        html = apply_edits(current["html"], edits)
+        if not edits and any(v is not None for v in (title, description, icon, display, card_height, caps_requested)):
+            html = current["html"]  # settings only: no find/replace needed
+        else:
+            html = apply_edits(current["html"], edits)
         return self.save(
             artifact_id,
             html,
@@ -1844,10 +1847,13 @@ class TimerEngine(_Listeners):
             if not hold or el - seconds < hold["end"] - EPS:
                 ts["ot"] = None
             return
-        for step in timer["steps"]:
+        not_started = set()
+        if ts["waiting"] is not None:  # held at a check: steps sharing its time are still ahead of it
+            not_started = {e[3] for e in self._events(timer, tid)[ts["ev"]:] if e[2] == "start"}
+        for number, step in enumerate(timer["steps"]):
             if step["track"] != tid or (step.get("reminder") and step.get("anchor") == "timer"):
                 continue
-            if step["at"] > el + EPS:
+            if step["at"] > el + EPS or (number in not_started and not step.get("reminder")):
                 step["at"] = max(el + 1.0, step["at"] + seconds)
             elif step.get("duration") and not step.get("gate") and step["at"] + step["duration"] > el + EPS:
                 step["duration"] = max(el + 1.0 - step["at"], step["duration"] + seconds)
@@ -1928,8 +1934,14 @@ class TimerEngine(_Listeners):
         self._release(ts, big_t)
         if seconds:
             # Push the rest of this lane back and ask again when the extra time is up.
-            for step in timer["steps"]:
-                if step["track"] == tid and step["at"] > el + EPS:
+            # Steps that have not started yet move back too, including one that shares the check's
+            # own time (it comes after the check in the lane's order and must not jump ahead of it).
+            events = self._events(timer, tid)
+            waiting_to_start = {e[3] for e in events[ts["ev"]:] if e[2] == "start"}
+            for number, step in enumerate(timer["steps"]):
+                if step["track"] == tid and not step.get("reminder") and (
+                    step["at"] > el + EPS or (number in waiting_to_start and number != index)
+                ):
                     step["at"] += seconds
             for regate in ts["regates"]:
                 if regate["at"] > el + EPS:

@@ -345,10 +345,12 @@ async def main():
     assert res["display"] == "page", res
     res = await tool("artifact_patch", artifact_id="plain", base_version=1, edits=[{"old": "hello", "new": "hi"}], display="both", card_height="auto")
     assert (res["display"], res["card_height"], res["version"]) == ("both", "auto", 2), res
+    res = await tool("artifact_patch", artifact_id="plain", base_version=2, display="card")
+    assert (res["display"], res["version"]) == ("card", 2), res  # settings only: no edits, no new version
     bad = await tool("artifact_publish", artifact_id="mini", base_version=1, html="<p>tile</p>", card_height=5)
     assert bad["error"] == "invalid", bad
     listed = {a["id"]: a for a in (await tool("artifact_list"))["artifacts"]}
-    assert (listed["mini"]["display"], listed["mini"]["card_height"]) == ("card", 300) and listed["plain"]["display"] == "both", listed
+    assert (listed["mini"]["display"], listed["mini"]["card_height"]) == ("card", 300) and listed["plain"]["display"] == "card", listed
     meta = await tool("artifact_read", artifact_id="mini", metadata_only=True)
     assert meta["display"] == "card" and meta["card_height"] == 300, meta
     r = await ws("save", artifact_id="mini", html="<style>.x{height:900px}</style><p>tile</p>", base_version=1, display="page")
