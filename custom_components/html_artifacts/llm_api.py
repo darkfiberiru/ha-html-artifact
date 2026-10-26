@@ -29,13 +29,30 @@ HTML ARTIFACTS FOR HOME ASSISTANT - AUTHORING GUIDE
 
 An artifact is one self-contained HTML page (inline CSS and JS) that you publish
 into Home Assistant. It is shown in a sidebar panel or dashboard card, in a
-sandboxed iframe, and can be edited by hand. Home Assistant is the display and the
-shared home of the page: it is used inside HA (panel or dashboard card, signed-in
-users only) and shared by everyone in the household who has HA access. There is no
-public link, so do not design a page to be opened outside HA, and do not rely on
-anything outside `window.ha` for state shared between devices. Any kind of page is fine: trackers,
+sandboxed iframe, and can be edited by hand. Home Assistant is the host: it stores
+the page and its data (kv, assets), runs timers, signs the user in and sends
+notifications. It is shared by everyone with HA access and has no public link, so
+do not design a page to be opened outside HA or rely on anything but `window.ha`
+for state shared between devices. Any kind of page is fine: trackers,
 checklists, dashboards, kitchen displays, planners, games. Unlike a normal
 artifact, it can keep state on the server and use `window.ha` (below).
+
+DISPLAY TYPE: DASHBOARD CARD OR PAGE (decide first, pass it to artifact_publish)
+  display "card"  - sits on a dashboard next to other cards (what's cooking, a chore tile).
+                    Compact, readable at a glance, about 350-500 px wide, NO inner scrolling,
+                    use HA theme variables (--primary-text-color, --card-background-color ...),
+                    and respect card_height (pixels, or "auto" to size to the content).
+  display "page"  - a full-screen app opened from the Artifacts sidebar or a link (Recipes,
+                    a cook-along). Full viewport, mobile-first, sticky controls are fine.
+                    Never shrunk into a card. This is the default for new artifacts.
+  display "both"  - adapts. Read `ha.host` ("card" | "panel" | "full"; ha.hostHeight is the
+                    card height in px or null) after `await ha.ready`, and subscribe with
+                    ha.onHostChange(cb). `<html data-ha-host="card">` is set for CSS.
+  Artifacts that existed before this setting count as "both" until you set it. To change
+  only display / card_height, call artifact_publish with the same html and base_version:
+  no new version is created.
+  artifact_check renders a card at 420 px wide at its card_height, and a page at phone and
+  desktop width; lint warns when a card is taller than its card_height.
 
 WORKFLOW
 1. artifact_list (ids, versions, sizes, capabilities), then artifact_read before
@@ -307,6 +324,8 @@ class PublishTool(_Tool):
             vol.Optional("title"): str,
             vol.Optional("description"): str,
             vol.Optional("icon"): str,
+            vol.Optional("display"): vol.In(["card", "page", "both"]),
+            vol.Optional("card_height"): vol.Any(int, str),
             vol.Optional("capabilities"): dict,
         }
     )
@@ -334,6 +353,8 @@ class PublishTool(_Tool):
             title=args.get("title"),
             description=args.get("description"),
             icon=args.get("icon"),
+            display=args.get("display"),
+            card_height=args.get("card_height"),
             base_version=args.get("base_version"),
             caps_requested=args.get("capabilities"),
             source="claude",
@@ -345,7 +366,7 @@ class PublishTool(_Tool):
             if not args.get("keep_asset"):
                 await rt.async_assets(rt.assets.delete, args["artifact_id"], asset_path)
                 out["asset_removed"] = True
-        out["lint"] = lint_html(html, out.get("caps_requested"))
+        out["lint"] = lint_html(html, out.get("caps_requested"), out.get("display"), out.get("card_height"))
         out["next"] = "Call artifact_check to see how it renders in a real browser."
         return out
 
@@ -376,6 +397,9 @@ class PatchTool(_Tool):
             ],
             vol.Optional("title"): str,
             vol.Optional("description"): str,
+            vol.Optional("icon"): str,
+            vol.Optional("display"): vol.In(["card", "page", "both"]),
+            vol.Optional("card_height"): vol.Any(int, str),
             vol.Optional("capabilities"): dict,
         }
     )
@@ -397,12 +421,15 @@ class PatchTool(_Tool):
             base_version=args["base_version"],
             title=args.get("title"),
             description=args.get("description"),
+            icon=args.get("icon"),
+            display=args.get("display"),
+            card_height=args.get("card_height"),
             caps_requested=args.get("capabilities"),
             source="claude",
             updated_by="claude",
         )
         out = {k: v for k, v in result.items() if k != "html"}
-        out["lint"] = lint_html(result["html"], out.get("caps_requested"))
+        out["lint"] = lint_html(result["html"], out.get("caps_requested"), out.get("display"), out.get("card_height"))
         out["next"] = "Call artifact_check to see how it renders in a real browser."
         return out
 
@@ -460,6 +487,16 @@ class CheckTool(_Tool):
         else:
             status = "pending"
         render: dict = {"status": status, "errors": errors, "renders": report["renders"] if report else 0}
+        lint = lint_html(artifact["html"], artifact.get("caps_requested"), artifact.get("display"), artifact.get("card_height"))
+        if report and report.get("frames"):
+            render["frames"] = report["frames"]
+            height = artifact.get("card_height")
+            if artifact.get("display") in ("card", "both") and isinstance(height, int):
+                for frame in report["frames"]:
+                    if frame["w"] <= 600 and frame["h"] == height and frame["content"] > height + 24:
+                        lint.append({"level": "warning", "code": "card_overflow", "message":
+                                     f"as a {frame['w']}px-wide card the page is {frame['content']}px tall but card_height "
+                                     f"is {height}: it will scroll inside the card. Raise card_height, use \"auto\", or tighten the layout."})
         if report:
             render["reported_by"] = report["sources"]
         if status == "pending":
@@ -471,7 +508,7 @@ class CheckTool(_Tool):
         return {
             "artifact_id": artifact_id,
             "version": version,
-            "lint": lint_html(artifact["html"], artifact.get("caps_requested")),
+            "lint": lint,
             "render": render,
         }
 

@@ -25,19 +25,37 @@ trackers, kitchen displays, chore boards, planners, status walls, games.
                          └ sandboxed iframe, postMessage bridge = window.ha
 ```
 
-## Where an artifact is meant to be used
+## Dashboard card or page
 
-Home Assistant is the **display and the shared home** of a page, not a publishing site.
+Every artifact has a **display type** (`display`), which says what it was made for:
 
-- **Display:** you open a page inside Home Assistant, in the **Artifacts** sidebar panel (on any device where you are
-  signed in to HA) or as a **dashboard card** on a wall tablet, phone or the HA app. That is where `window.ha` works.
-- **Sharing:** the household shares it by having an HA account. Everyone who opens the page sees the same version and
-  the same live state (`ha.kv`, timers), and what the page can touch is limited by the permissions you approved.
-- **Not a public link:** there is no public URL for a page, and `window.ha` does nothing outside Home Assistant. To
-  show it to someone with no HA account, give them access to HA or send them the HTML file, which opens as a plain
-  page without `window.ha`.
-- **Claude's side:** Claude publishes and edits pages over MCP or REST and never needs to see the display; it uses
-  `artifact_check` to see how a page renders.
+| Display type | Made for | Examples |
+|---|---|---|
+| **Dashboard card** (`card`) | Sits on a dashboard next to other cards. Small, readable at a glance, fixed or `auto` height, works at card width (about 350-500 px). | A "what's cooking" timer, a chore status tile |
+| **Page** (`page`) | A full-screen app opened from the Artifacts sidebar or a link; never meant to be shrunk into a card. | The Recipes page, a cook-along page |
+| **Both** (`both`) | Adapts: compact in a card, full in the sidebar. It can read `ha.host`. | A timer with a mini and a full view |
+
+Home Assistant is the **host** of a page, not a publishing site: it stores the page and its data (`ha.kv`, asset
+files), runs its timers, signs the user in and sends its notifications. Everyone with an HA account sees the same
+version and the same live state; what a page may touch is limited by the permissions you approved. There is no public
+URL, and `window.ha` does nothing outside Home Assistant.
+
+- **Setting it.** Claude passes `display` (and optionally `card_height`: pixels, or `"auto"`) to `artifact_publish` or
+  `artifact_patch`; in the Artifacts sidebar, Edit mode has a display type menu and a card height box. New artifacts
+  default to `page`; artifacts that existed before this field count as `both` until you set it. Changing only these
+  settings does not create a new version.
+- **Artifacts sidebar.** Opens on the list. Each artifact shows a *Card*, *Page* or *Card + page* badge, with
+  All / Cards / Pages filters. A card previews in a card-width frame at its `card_height`; a page fills the screen.
+  **Link** copies `/html-artifacts?artifact=<id>`, which opens that artifact full size: bookmark it or add it to a
+  phone home screen.
+- **Dashboard card.** The picker lists cards and *both* first and hides pages behind **Show pages too**; choosing a
+  page warns that it may not fit a card. A new card preselects the first card artifact and uses its `card_height`
+  (500 if none). A card with no `height` of its own uses the artifact's `card_height`.
+- **In the page.** `ha.host` is `"card"`, `"panel"` or `"full"` (and `ha.hostHeight` is the card's height in pixels,
+  or `null` for `auto`); `ha.onHostChange(cb)` fires when it changes, and the `<html>` element carries
+  `data-ha-host` for CSS. A `both` artifact can adapt: `if (ha.host === "card") showCompact()`.
+- **Render check.** `artifact_check` runs a card at 420 px wide at its `card_height`, and a page at phone and desktop
+  width. It warns (`card_tall`, `card_overflow`) when a card is much taller than its `card_height`.
 
 ## Install
 
@@ -57,7 +75,7 @@ update, with release notes and an **Install** button. After installing, restart 
 - **What counts as a new version:** the latest GitHub *release* if there is one, otherwise the `version` in
   `manifest.json` on the default branch. To ship an update, bump `version` in both `manifest.json` and `const.py`
   (a test fails if they differ) and push; optionally tag a release for release notes.
-- **With HACS**, versions come from GitHub *releases*, not from `manifest.json`. There are no releases yet, so HACS shows the latest commit hash instead of `0.8.2` until you publish one (Releases > Draft a new release, tag `v0.8.2`). Each later bump needs a new release for HACS to offer it as an update.
+- **With HACS**, versions come from GitHub *releases*, not from `manifest.json`. There are no releases yet, so HACS shows the latest commit hash instead of `0.9.0` until you publish one (Releases > Draft a new release, tag `v0.9.0`). Each later bump needs a new release for HACS to offer it as an update.
 - **HACS wins.** If HACS lists this repo as installed, the built-in updater doesn't create its entity (and removes an old one) so the two never disagree. Tick *Use the built-in updater even when HACS manages this integration* under **Configure** to override; it applies after a restart.
 - **Checked every 6 hours**, or run *Check for updates* on the entity.
 - Installing swaps `custom_components/html_artifacts` as a unit: the new copy is unpacked and validated first, and the old one is put back if the swap fails.

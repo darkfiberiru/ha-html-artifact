@@ -81,6 +81,8 @@ def ws_get(rt, connection, msg):
         vol.Optional("title"): vol.Any(str, None),
         vol.Optional("description"): vol.Any(str, None),
         vol.Optional("icon"): vol.Any(str, None),
+        vol.Optional("display"): vol.Any(str, None),
+        vol.Optional("card_height"): vol.Any(int, str, None),
         vol.Optional("base_version"): vol.Any(int, None),
         vol.Optional("caps_requested"): vol.Any(dict, None),
     },
@@ -92,6 +94,8 @@ def ws_save(rt, connection, msg):
         title=msg.get("title"),
         description=msg.get("description"),
         icon=msg.get("icon"),
+        display=msg.get("display"),
+        card_height=msg.get("card_height"),
         base_version=msg.get("base_version"),
         caps_requested=msg.get("caps_requested"),
         source="user",
@@ -235,6 +239,7 @@ def ws_timers_control(rt, connection, msg):
         vol.Required("source"): vol.In(["dry-run", "viewer"]),
         vol.Optional("settled", default=False): bool,
         vol.Optional("errors", default=[]): [dict],
+        vol.Optional("frames", default=[]): [dict],
     },
 )
 def ws_report(rt, connection, msg):
@@ -250,6 +255,7 @@ def ws_report(rt, connection, msg):
         source=msg["source"],
         settled=msg["settled"],
         errors=msg["errors"][:20],
+        frames=msg["frames"][:5],
     )
     return {"stale": False}
 

@@ -115,6 +115,37 @@ class _Listeners:
                 _LOGGER.exception("html_artifacts listener failed")
 
 
+DISPLAYS = ("card", "page", "both")
+
+
+def _clean_display(value: Any) -> str | None:
+    if value is None or value == "":
+        return None
+    if value not in DISPLAYS:
+        raise ArtifactError("invalid", 'display must be "card", "page" or "both"')
+    return value
+
+
+def _clean_card_height(value: Any) -> int | str | None:
+    """Starting height of a dashboard card: pixels (100-4000) or "auto"; None = not given."""
+    if value is None or value == "":
+        return None
+    if value == "auto":
+        return "auto"
+    if isinstance(value, bool):
+        raise ArtifactError("invalid", 'card_height must be a number of pixels or "auto"')
+    if isinstance(value, str):
+        value = value.strip()
+        if not value.isdigit():
+            raise ArtifactError("invalid", 'card_height must be a number of pixels or "auto"')
+    elif not isinstance(value, (int, float)):
+        raise ArtifactError("invalid", 'card_height must be a number of pixels or "auto"')
+    number = int(float(value))
+    if not 100 <= number <= 4000:
+        raise ArtifactError("invalid", "card_height must be between 100 and 4000 pixels")
+    return number
+
+
 def _clean_str(value: Any, limit: int, what: str, allow_empty: bool = False) -> str:
     if not isinstance(value, str):
         raise ArtifactError("invalid", f"{what} must be a string")
@@ -182,7 +213,9 @@ def _host(url: str) -> str:
     return match.group(1).lower() if match else ""
 
 
-def lint_html(html: str, caps_requested: Any = None) -> list[dict[str, str]]:
+def lint_html(
+    html: str, caps_requested: Any = None, display: str | None = None, card_height: Any = None
+) -> list[dict[str, str]]:
     """Heuristic warnings; they never block a publish. Each is {level, code, message}."""
     out: list[dict[str, str]] = []
     wants_network = bool((caps_requested or {}).get("network"))
@@ -220,6 +253,12 @@ def lint_html(html: str, caps_requested: Any = None) -> list[dict[str, str]]:
         add("error", "script_tag", "unbalanced <script> tags: the page's JavaScript will not run as written.")
     if not re.search(r"<meta[^>]+name\s*=\s*[\"']?viewport", code_only, re.I):
         add("info", "viewport", 'no <meta name="viewport">: the page will render zoomed-out on phones.')
+    if display == "card" and isinstance(card_height, int):
+        tall = [int(n) for n in re.findall(r"(?<![-\w])(?:min-)?height\s*:\s*(\d{3,4})px", code_only)]
+        if tall and max(tall) > card_height * 1.1:
+            add("warning", "card_tall",
+                f"this is a dashboard card of {card_height}px but the page sets a {max(tall)}px height: "
+                "keep a card compact (no inner scrolling) or make it a page.")
     return out
 
 
@@ -246,16 +285,23 @@ class RenderReports(_Listeners):
         source: str,
         settled: bool,
         errors: list[dict[str, Any]] | None = None,
+        frames: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         report = self._data.get(artifact_id)
         if report is None or report["version"] != version:
-            report = {"version": version, "renders": 0, "settled": False, "sources": [], "errors": [], "updated": 0.0}
+            report = {"version": version, "renders": 0, "settled": False, "sources": [], "errors": [],
+                      "frames": [], "updated": 0.0}
             self._data[artifact_id] = report
         if settled:
             report["renders"] += 1
             report["settled"] = True
         if source not in report["sources"]:
             report["sources"].append(source)
+        for raw in frames or []:
+            if isinstance(raw, dict) and all(isinstance(raw.get(k), (int, float)) for k in ("w", "h", "content")):
+                frame = {k: int(raw[k]) for k in ("w", "h", "content")}
+                report["frames"] = [f for f in report["frames"] if (f["w"], f["h"]) != (frame["w"], frame["h"])][-5:]
+                report["frames"].append(frame)
         seen = {(e["level"], e["message"]) for e in report["errors"]}
         for raw in errors or []:
             if not isinstance(raw, dict):
@@ -318,6 +364,8 @@ class ArtifactStore(_Listeners):
             "updated", "updated_by", "source", "caps_requested", "caps_granted",
         )
         out = copy.deepcopy({key: artifact[key] for key in keys})
+        out["display"] = artifact.get("display") or "both"  # artifacts made before this field
+        out["card_height"] = artifact.get("card_height")
         out["size"] = len(artifact["html"].encode("utf-8"))
         return out
 
@@ -369,6 +417,8 @@ class ArtifactStore(_Listeners):
         title: str | None = None,
         description: str | None = None,
         icon: str | None = None,
+        display: str | None = None,
+        card_height: Any = None,
         base_version: int | None = None,
         source: str = "user",
         updated_by: str | None = None,
@@ -394,6 +444,8 @@ class ArtifactStore(_Listeners):
         )
         icon = _clean_str(icon, 64, "icon", allow_empty=True) if icon is not None else None
         requested = normalize_grants(caps_requested) if caps_requested is not None else None
+        display = _clean_display(display)
+        card_height = _clean_card_height(card_height)
 
         current = self._data["artifacts"].get(artifact_id)
         if current is not None:
@@ -419,6 +471,8 @@ class ArtifactStore(_Listeners):
                 "title": title or artifact_id,
                 "description": description or "",
                 "icon": icon or "",
+                "display": display or "page",
+                "card_height": card_height,
                 "html": html,
                 "version": 1,
                 "created": now,
@@ -440,6 +494,15 @@ class ArtifactStore(_Listeners):
                 and (requested is None or requested == artifact["caps_requested"])
             )
             if unchanged:
+                # Display type and card height are settings, not content: no new version.
+                changed = False
+                if display is not None and display != (artifact.get("display") or "both"):
+                    artifact["display"], changed = display, True
+                if card_height is not None and card_height != artifact.get("card_height"):
+                    artifact["card_height"], changed = card_height, True
+                if changed:
+                    self._save()
+                    self._emit({"type": "artifact", "change": "meta", "artifact": self.summary(artifact)})
                 return self.get(artifact_id)
             artifact["history"].append(
                 {
@@ -466,6 +529,10 @@ class ArtifactStore(_Listeners):
                 artifact["icon"] = icon
             if requested is not None:
                 artifact["caps_requested"] = requested
+            if display is not None:
+                artifact["display"] = display
+            if card_height is not None:
+                artifact["card_height"] = card_height
 
         self._save()
         self._emit({"type": "artifact", "change": "save", "artifact": self.summary(artifact)})
@@ -480,6 +547,8 @@ class ArtifactStore(_Listeners):
         title: str | None = None,
         description: str | None = None,
         icon: str | None = None,
+        display: str | None = None,
+        card_height: Any = None,
         caps_requested: Any = None,
         source: str = "user",
         updated_by: str | None = None,
@@ -511,6 +580,8 @@ class ArtifactStore(_Listeners):
             title=title,
             description=description,
             icon=icon,
+            display=display,
+            card_height=card_height,
             base_version=base_version,
             caps_requested=caps_requested,
             source=source,

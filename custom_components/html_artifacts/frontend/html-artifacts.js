@@ -243,6 +243,21 @@
       return view(timers.get(t.id));
     };
 
+    const hostSubs = new Set();
+    function setHost(info) {
+      if (!info) return;
+      ha.host = info.kind || "panel";
+      ha.hostHeight = Number.isFinite(info.height) ? info.height : null;
+      document.documentElement.setAttribute("data-ha-host", ha.host);
+      hostSubs.forEach((cb) => {
+        try {
+          cb({ host: ha.host, height: ha.hostHeight });
+        } catch (err) {
+          console.error(err);
+        }
+      });
+    }
+
     function applyTheme(theme) {
       if (!theme) return;
       const root = document.documentElement;
@@ -253,6 +268,9 @@
 
     function onEvent(ev) {
       switch (ev.type) {
+        case "host":
+          setHost(ev);
+          break;
         case "kv":
           kvSubs.forEach((cb) => cb({ key: ev.key, value: ev.value, deleted: !!ev.deleted }));
           break;
@@ -312,6 +330,12 @@
       user: null,
       artifact: null,
       grants: null,
+      host: "panel", // where the page is shown: "card" (dashboard card), "panel" (Artifacts sidebar) or "full" (full screen)
+      hostHeight: null, // the card's height in px while host is "card" (null when it sizes itself)
+      onHostChange(cb) {
+        hostSubs.add(cb);
+        return () => hostSubs.delete(cb);
+      },
       ready: null,
       kv: {
         get: (key) => call("kv.get", { key }),
@@ -404,6 +428,7 @@
       ha.user = info.user;
       ha.artifact = info.artifact;
       ha.grants = info.grants;
+      setHost(info.host);
       timers.clear();
       info.timers.forEach((t) => timers.set(t.id, stamp(t)));
       applyTheme(info.theme);
@@ -461,6 +486,8 @@
       this.host = opts.host;
       this.autoHeight = !!opts.autoHeight;
       this.height = opts.height || 0;
+      this.hostKind = opts.hostKind || "panel";
+      this.onResize = opts.onResize || null;
       this.onRemoteChange = opts.onRemoteChange || null;
       this._queue = [];
       this._settledPending = false;
@@ -562,6 +589,12 @@
       this.host.replaceChildren(frame);
     }
 
+    setHost(kind, height) {
+      this.hostKind = kind;
+      if (height !== undefined) this.height = height || 0;
+      this._post({ event: { type: "host", kind, height: kind === "card" && this.height ? this.height : null } });
+    }
+
     updateHass(hass) {
       this.hass = hass;
       if (!this.iframe) return;
@@ -648,6 +681,7 @@
       if (!m || m.ha !== 1) return;
       if (m.notify === "resize") {
         if (this.autoHeight && Number.isFinite(m.height)) this.iframe.style.height = Math.max(60, m.height) + "px";
+        if (this.onResize && Number.isFinite(m.height)) this.onResize(m.height);
         return;
       }
       if (m.notify === "report") {
@@ -707,6 +741,7 @@
             grants: this.grants,
             timers: t.timers,
             theme: this._theme(),
+            host: { kind: this.hostKind, height: this.hostKind === "card" && this.height ? this.height : null },
           };
         }
         case "kv.get":
@@ -864,6 +899,14 @@
     #editor { border: 0; border-right: 1px solid var(--divider-color); border-radius: 0; resize: none; font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; tab-size: 2; white-space: pre; background: var(--code-editor-background-color, var(--card-background-color)); min-height: 0; }
     .preview { position: relative; min-height: 0; overflow: hidden; background: var(--card-background-color); }
     .preview iframe { position: absolute !important; inset: 0; width: 100% !important; height: 100% !important; }
+    .preview.cardframe { align-self: start; justify-self: center; width: min(100%, 480px); height: var(--cardh, 500px); margin: 16px 0; border: 1px solid var(--divider-color); border-radius: 12px; }
+    .kind { font-size: 11px; font-weight: 700; letter-spacing: .02em; padding: 1px 8px; border-radius: 999px; background: color-mix(in srgb, var(--primary-color) 14%, transparent); color: var(--primary-color); }
+    .kind.card { background: color-mix(in srgb, var(--accent-color, #ff9800) 18%, transparent); color: var(--accent-color, #b26a00); }
+    .filters { display: flex; gap: 6px; padding: 8px 12px; border-bottom: 1px solid var(--divider-color); }
+    .filters button { padding: 3px 12px; border-radius: 999px; font-size: 13px; }
+    .filters button.on { background: var(--primary-color); color: var(--text-primary-color, #fff); border-color: transparent; }
+    #disp, #cardh { flex: 0 0 auto; }
+    #cardh { width: 84px; min-width: 0; }
     .pill { cursor: pointer; }
     .app.immersive .main { position: fixed; inset: 0; z-index: 2147483000; background: var(--card-background-color); }
     .app.immersive .bar, .app.immersive .banner { display: none !important; }
@@ -886,6 +929,7 @@
     <div class="app" data-mode="list">
       <aside>
         <div class="side-head"><button id="menu" class="icon" hidden>☰</button><b>Artifacts</b><button id="new" class="icon" title="New artifact">+</button></div>
+        <div class="filters" id="filters"><button data-f="all" class="on">All</button><button data-f="card">Cards</button><button data-f="page">Pages</button></div>
         <ul id="list"></ul>
       </aside>
       <section class="main">
@@ -895,11 +939,14 @@
           <input id="title" placeholder="Title" disabled>
           <span id="pill" class="pill" hidden title="Review permissions"></span>
           <select id="hist" class="editonly" title="Version history" disabled></select>
+          <select id="disp" class="editonly" title="Display type: a dashboard card, a page, or both" disabled><option value="page">Page</option><option value="card">Dashboard card</option><option value="both">Card and page</option></select>
+          <input id="cardh" class="editonly" title="Card height in px, or auto" placeholder="Card px" disabled>
           <button id="perms" disabled>Permissions</button>
           <button id="del" class="editonly" disabled>Delete</button>
           <button id="save" class="primary editonly" disabled>Save</button>
           <button id="edit" class="viewonly" title="Edit the page source" disabled>Edit</button>
           <button id="done" class="editonly" title="Back to the page">Done</button>
+          <button id="link" class="viewonly" title="Copy a link that opens this artifact" disabled>Link</button>
           <button id="full" class="viewonly" title="Full screen" disabled>⛶</button>
         </div>
         <div id="banner" class="banner" hidden></div>
@@ -1000,6 +1047,20 @@
       this.$("edit").onclick = () => this._setMode("edit");
       this.$("done").onclick = () => this._done();
       this.$("full").onclick = () => this._enterImmersive();
+      this.$("link").onclick = () => this._copyLink();
+      this.$("disp").onchange = () => this._saveDisplay();
+      this.$("cardh").onchange = () => this._saveDisplay();
+      this.$("filters").onclick = (e) => {
+        const b = e.target.closest("button[data-f]");
+        if (!b) return;
+        this._filter = b.dataset.f;
+        try {
+          localStorage.setItem("html_artifacts:filter", this._filter);
+        } catch (err) {
+          /* per-viewer convenience only */
+        }
+        this._renderList();
+      };
       this.$("exit").onclick = () => this._exitImmersive();
       this.$("pill").onclick = () => this._cur && this._openPerms();
       this.$("new").onclick = () => this._create();
@@ -1039,7 +1100,16 @@
       this.$("g-cancel").onclick = () => this.$("dlg").close();
       this.$("g-fill").onclick = () => this._fillGrants(this._cur.caps_requested || {});
       this.$("g-save").onclick = () => this._saveGrants();
-      this._runner = new ArtifactRunner({ hass: this._hass, host: this.$("preview") });
+      try {
+        this._filter = localStorage.getItem("html_artifacts:filter") || "all";
+      } catch (err) {
+        this._filter = "all";
+      }
+      this._runner = new ArtifactRunner({
+        hass: this._hass,
+        host: this.$("preview"),
+        onResize: (h) => this._cardResize(h),
+      });
     }
 
     async _start() {
@@ -1085,12 +1155,21 @@
         list.innerHTML = '<li><span class="s">No artifacts yet. Ask Claude to publish one, or press +.</span></li>';
         return;
       }
-      list.innerHTML = this._list
-        .map(
-          (a) => `<li data-id="${esc(a.id)}" class="${this._cur && this._cur.id === a.id ? "sel" : ""}">
-            <span class="t">${pendingCaps(a) ? '<span class="dot" title="Permissions requested"></span>' : ""}${esc(a.title)}</span>
-            <span class="s">${esc(a.id)} · v${a.version} · ${esc(a.updated_by)}</span></li>`
-        )
+      const f = this._filter || "all";
+      for (const b of this.$("filters").querySelectorAll("button")) b.classList.toggle("on", b.dataset.f === f);
+      const shown = this._list.filter((a) => f === "all" || (a.display || "both") === f || (a.display || "both") === "both");
+      if (!shown.length) {
+        list.innerHTML = `<li><span class="s">No ${f === "card" ? "dashboard cards" : "pages"} yet.</span></li>`;
+        return;
+      }
+      list.innerHTML = shown
+        .map((a) => {
+          const kind = a.display || "both";
+          const badge = kind === "card" ? '<span class="kind card">Card</span>' : kind === "page" ? '<span class="kind">Page</span>' : '<span class="kind">Card + page</span>';
+          return `<li data-id="${esc(a.id)}" class="${this._cur && this._cur.id === a.id ? "sel" : ""}">
+            <span class="t">${pendingCaps(a) ? '<span class="dot" title="Permissions requested"></span>' : ""}${esc(a.title)} ${badge}</span>
+            <span class="s">${esc(a.id)} · v${a.version} · ${esc(a.updated_by)}</span></li>`;
+        })
         .join("");
     }
 
@@ -1143,6 +1222,7 @@
       if (!this._cur || this._mode !== "view") return;
       this.$("app").classList.add("immersive");
       this.$("exit").hidden = false;
+      if (this._runner) this._runner.setHost("full");
       this._onKey = (e) => {
         if (e.key === "Escape") this._exitImmersive();
       };
@@ -1165,6 +1245,7 @@
       if (!this._built) return;
       this.$("app").classList.remove("immersive");
       this.$("exit").hidden = true;
+      if (this._runner && this._cur) this._frameKind();
       if (this._onKey) window.removeEventListener("keydown", this._onKey);
       if (this._onFs) document.removeEventListener("fullscreenchange", this._onFs);
       this._onKey = this._onFs = null;
@@ -1193,7 +1274,7 @@
       this._dirty = false;
       this.$("editor").value = this._cur.html;
       this.$("title").value = this._cur.title;
-      for (const el of ["editor", "title", "hist", "perms", "del", "edit", "full"]) this.$(el).disabled = false;
+      for (const el of ["editor", "title", "hist", "perms", "del", "edit", "full", "link", "disp", "cardh"]) this.$(el).disabled = false;
       this.$("save").disabled = true;
       this._banner(null);
       this._renderMeta();
@@ -1205,6 +1286,10 @@
     _renderMeta() {
       const pill = this.$("pill");
       const a = this._cur;
+      this.$("disp").value = a.display || "both";
+      if (this.$("cardh") !== this.shadowRoot.activeElement) this.$("cardh").value = a.card_height === null || a.card_height === undefined ? "" : String(a.card_height);
+      this.$("cardh").hidden = (a.display || "both") === "page";
+      this._frameKind();
       const needs = pendingCaps(a);
       const r = a.caps_requested || {};
       const wants = (r.entities || []).length || (r.services || []).length || r.notify || r.network;
@@ -1215,7 +1300,55 @@
 
     _renderPreview() {
       if (!this._cur || !this._runner) return;
+      this._frameKind();
       this._runner.mount(this._cur, this.$("editor").value, { report: !this._dirty });
+    }
+
+    // A card is previewed in a card-width frame at its own height; a page fills the screen.
+    _frameKind() {
+      const a = this._cur;
+      const box = this.$("preview");
+      const card = !!a && a.display === "card";
+      box.classList.toggle("cardframe", card);
+      const px = card && Number.isFinite(a.card_height) ? a.card_height : null;
+      box.style.setProperty("--cardh", (px || 500) + "px");
+      if (this._runner) {
+        this._runner.autoHeight = false;
+        this._runner.setHost(card ? "card" : this.$("app").classList.contains("immersive") ? "full" : "panel", px || 0);
+        this._cardAuto = card && !px;
+      }
+    }
+
+    _cardResize(h) {
+      if (this._cardAuto) this.$("preview").style.setProperty("--cardh", Math.max(80, Math.round(h)) + "px");
+    }
+
+    async _saveDisplay() {
+      if (!this._cur) return;
+      const raw = this.$("cardh").value.trim().toLowerCase();
+      const body = { artifact_id: this._cur.id, html: this._cur.html, base_version: this._cur.version, display: this.$("disp").value };
+      if (raw) body.card_height = raw === "auto" ? "auto" : Number(raw);
+      try {
+        const saved = await this._ws("save", body);
+        this._cur = Object.assign({}, this._cur, saved, { html: this._cur.html });
+        this._renderMeta();
+        this._renderList();
+        this._toast("Display type saved");
+      } catch (err) {
+        this._toast((err && err.message) || "Could not save the display type");
+        this._renderMeta();
+      }
+    }
+
+    async _copyLink() {
+      if (!this._cur) return;
+      const url = `${window.location.origin}/html-artifacts?artifact=${encodeURIComponent(this._cur.id)}`;
+      try {
+        await navigator.clipboard.writeText(url);
+        this._toast("Link copied");
+      } catch (err) {
+        prompt("Link to this artifact", url);
+      }
     }
 
     async _refreshHistory() {
@@ -1422,7 +1555,9 @@
       // Preselect the first artifact so a freshly added card shows something right away.
       try {
         const { artifacts } = await hass.connection.sendMessagePromise({ type: WS + "list" });
-        if (artifacts && artifacts.length) return { artifact: artifacts[0].id, height: 500 };
+        // A dashboard card should start with something built for a card, so skip pages.
+        const first = (artifacts || []).find((a) => (a.display || "both") !== "page");
+        if (first) return { artifact: first.id, height: first.card_height || 500 };
       } catch (err) {
         /* fall through to the empty stub */
       }
@@ -1466,6 +1601,7 @@
         hass: this._hass,
         host: this._root.getElementById("host"),
         autoHeight: auto,
+        hostKind: "card",
         height: auto ? 0 : Number(this._config.height) || 500,
         onRemoteChange: () => this._load(),
       });
@@ -1492,6 +1628,14 @@
           }
           art = await get(hit.id);
         }
+        if (this._config.height === undefined && art.card_height) {
+          // the card has no height of its own: use the one the artifact was made for
+          const auto = art.card_height === "auto";
+          this._runner.autoHeight = auto;
+          this._runner.height = auto ? 0 : Number(art.card_height) || 500;
+        }
+        this._runner.hostKind = "card";
+        this._runner.height = this._runner.height || 0;
         this._runner.mount(art);
       } catch (err) {
         host.innerHTML = `<div class="err">Artifact "${esc(this._config.artifact)}" could not be loaded: ${esc((err && err.message) || "error")}</div>`;
@@ -1516,6 +1660,7 @@
           grants: art.caps_granted || {},
           timers: [],
           theme: { dark: false, vars: {} },
+          host: { kind: (art.__host && art.__host.kind) || "panel", height: (art.__host && art.__host.height) || null },
         };
       case "kv.list":
       case "entities.get":
@@ -1540,19 +1685,36 @@
     }
   }
 
-  function dryRun(art, timeoutMs) {
+  // The sizes a page is checked at: a card at its real width and height, a page at phone and desktop width.
+  function checkSizes(art) {
+    const display = art.display || "both";
+    const sizes = [];
+    if (display === "card" || display === "both") {
+      const h = Number.isFinite(art.card_height) ? art.card_height : 800;
+      sizes.push({ w: 420, h, kind: "card", height: Number.isFinite(art.card_height) ? art.card_height : null });
+    }
+    if (display === "page" || display === "both") {
+      sizes.push({ w: 420, h: 800, kind: "panel" }, { w: 1280, h: 800, kind: "panel" });
+    }
+    return sizes;
+  }
+
+  function dryRun(art, timeoutMs, size) {
     timeoutMs = timeoutMs || 8000;
+    size = size || { w: 420, h: 800, kind: "panel" };
+    art = Object.assign({}, art, { __host: { kind: size.kind, height: size.height || null } });
     return new Promise((resolve) => {
       const meta = composeWithMeta(art.html, art.caps_granted || {});
       const box = document.createElement("div");
-      box.style.cssText = "position:fixed;left:-10000px;top:0;width:420px;height:800px;overflow:hidden;opacity:0;pointer-events:none";
+      box.style.cssText = `position:fixed;left:-10000px;top:0;width:${size.w}px;height:${size.h}px;overflow:hidden;opacity:0;pointer-events:none`;
       const frame = document.createElement("iframe");
       frame.setAttribute("sandbox", "allow-scripts"); // no forms, modals, downloads or popups
       frame.setAttribute("aria-hidden", "true");
       frame.tabIndex = -1;
-      frame.style.cssText = "border:0;width:420px;height:800px";
+      frame.style.cssText = `border:0;width:${size.w}px;height:${size.h}px`;
       frame.srcdoc = meta.doc;
       const errors = [];
+      let content = 0;
       let done = false;
       let timer = null;
       const finish = (settled) => {
@@ -1561,13 +1723,15 @@
         clearTimeout(timer);
         window.removeEventListener("message", onMessage);
         box.remove();
-        resolve({ settled, errors });
+        resolve({ settled, errors, frame: { w: size.w, h: size.h, content: Math.round(content) } });
       };
       const onMessage = (e) => {
         if (e.source !== frame.contentWindow) return;
         const m = e.data;
         if (!m || m.ha !== 1) return;
-        if (m.notify === "report") {
+        if (m.notify === "resize" && Number.isFinite(m.height)) {
+          content = Math.max(content, m.height);
+        } else if (m.notify === "report") {
           const entry = { level: m.level, message: m.message };
           const line = userLine(meta, m.line);
           if (line) entry.line = line;
@@ -1615,10 +1779,13 @@
       }
       const art = await conn.sendMessagePromise({ type: WS + "get", artifact_id: id });
       if (art.version !== version) return; // superseded already
-      const res = await dryRun(art);
+      const results = [];
+      for (const size of checkSizes(art)) results.push(await dryRun(art, 8000, size));
       await conn.sendMessagePromise({
         type: WS + "report", artifact_id: id, version, source: "dry-run",
-        settled: res.settled, errors: res.errors.slice(0, 20),
+        settled: results.every((r) => r.settled),
+        errors: results.flatMap((r) => r.errors).slice(0, 20),
+        frames: results.map((r) => r.frame),
       });
     };
 
@@ -1654,9 +1821,14 @@
       select, input { font: inherit; color: var(--primary-text-color); background: var(--card-background-color); border: 1px solid var(--divider-color); border-radius: 8px; padding: 10px 12px; width: 100%; box-sizing: border-box; }
       .hint { font-size: 12px; color: var(--secondary-text-color); margin-top: -10px; }
       .err { color: var(--error-color, #b00020); font-size: 13px; margin-bottom: 12px; }
+      .warn { color: var(--warning-color, #b07a00); font-size: 13px; margin: -8px 0 16px; }
+      label.chk { display: flex; align-items: center; gap: 8px; }
+      label.chk input { width: auto; }
     </style>
     <div id="err" class="err" hidden></div>
     <label>Artifact<select id="art"></select></label>
+    <label class="chk"><input type="checkbox" id="pages"> Show pages too</label>
+    <div id="warn" class="warn" hidden>This artifact is built as a page; it may not fit a card.</div>
     <label>Height<input id="height" placeholder="500"></label>
     <div class="hint">A number of pixels, or <b>auto</b> to size to the page. Default 500.</div>
   `;
@@ -1696,6 +1868,10 @@
         this._root = this.attachShadow({ mode: "open" });
         this._root.innerHTML = EDITOR_HTML;
         this._root.getElementById("art").onchange = (e) => this._emit({ artifact: e.target.value });
+        this._root.getElementById("pages").onchange = (e) => {
+          this._showPages = e.target.checked;
+          this._render();
+        };
         this._root.getElementById("height").onchange = (e) => {
           const raw = e.target.value.trim().toLowerCase();
           const n = Number(raw);
@@ -1706,7 +1882,18 @@
       const current = this._config.artifact || "";
       const known = new Set((this._artifacts || []).map((a) => a.id));
       const opts = [`<option value="">${this._artifacts === null ? "Loading..." : "Choose an artifact"}</option>`];
-      (this._artifacts || []).forEach((a) => opts.push(`<option value="${esc(a.id)}">${esc(a.title)} (${esc(a.id)})</option>`));
+      // Cards (and artifacts that work as both) first; pages only on request or when already chosen.
+      const kind = (a) => a.display || "both";
+      const picked = (this._artifacts || []).find((a) => a.id === current);
+      const cards = (this._artifacts || []).filter((a) => kind(a) !== "page");
+      const pages = (this._artifacts || []).filter((a) => kind(a) === "page" && (this._showPages || a.id === current));
+      cards.forEach((a) => opts.push(`<option value="${esc(a.id)}">${esc(a.title)} (${esc(a.id)})</option>`));
+      if (pages.length) {
+        opts.push('<option disabled>── Pages ──</option>');
+        pages.forEach((a) => opts.push(`<option value="${esc(a.id)}">${esc(a.title)} (${esc(a.id)}) · page</option>`));
+      }
+      this._root.getElementById("pages").checked = !!this._showPages || !!(picked && kind(picked) === "page");
+      this._root.getElementById("warn").hidden = !(picked && kind(picked) === "page");
       if (current && !known.has(current) && this._artifacts !== null) opts.push(`<option value="${esc(current)}">${esc(current)} (not found)</option>`);
       sel.innerHTML = opts.join("");
       sel.value = current;
@@ -1738,7 +1925,7 @@
   }
 
   window.__htmlArtifacts = {
-    injectIntoHead, buildCsp, bridgeMain, globToRegExp, pendingCaps, composeDocument, composeWithMeta, userLine, dryRun, dryReply,
+    injectIntoHead, buildCsp, bridgeMain, globToRegExp, pendingCaps, composeDocument, composeWithMeta, userLine, dryRun, dryReply, checkSizes,
   };
   try {
     startValidator();

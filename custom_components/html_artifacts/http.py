@@ -3,7 +3,7 @@
   GET    /api/html_artifacts              list
   GET    /api/html_artifacts/<id>         read (includes html and version)
   GET    /api/html_artifacts/<id>?metadata=1   version, size, capabilities only (no html)
-  PUT    /api/html_artifacts/<id>         publish {html, base_version?, title?, description?, icon?, capabilities?}
+  PUT    /api/html_artifacts/<id>         publish {html, base_version?, title?, description?, icon?, display?, card_height?, capabilities?}
   PATCH  /api/html_artifacts/<id>         {base_version, edits: [{old_str, new_str}], title?, ...}: find/replace edits
   DELETE /api/html_artifacts/<id>         delete (admin)
 
@@ -120,6 +120,8 @@ class ArtifactView(_Base):
                 title=body.get("title"),
                 description=body.get("description"),
                 icon=body.get("icon"),
+                display=body.get("display"),
+                card_height=body.get("card_height"),
                 caps_requested=body.get("capabilities"),
                 source="api",
                 updated_by=f"api:{user.name}" if user else "api",
@@ -144,6 +146,8 @@ class ArtifactView(_Base):
                 title=body.get("title"),
                 description=body.get("description"),
                 icon=body.get("icon"),
+                display=body.get("display"),
+                card_height=body.get("card_height"),
                 base_version=body.get("base_version"),
                 caps_requested=body.get("capabilities"),
                 source="api",

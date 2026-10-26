@@ -336,6 +336,31 @@ async def main():
     assert res["version"] == 5 and res["render"]["status"] == "pending", "a new version starts without the old report"
     ok("artifact_check waits for a browser report, reports errors with lines, ignores stale versions")
 
+    # display type: card / page / both
+    res = await tool("artifact_publish", artifact_id="mini", html="<style>.x{height:900px}</style><p>tile</p>",
+                     display="card", card_height=300)
+    assert res["display"] == "card" and res["card_height"] == 300 and "html" not in res, res
+    assert any(w["code"] == "card_tall" for w in res["lint"]), res["lint"]
+    res = await tool("artifact_publish", artifact_id="plain", html="<p>hello</p>")
+    assert res["display"] == "page", res
+    res = await tool("artifact_patch", artifact_id="plain", base_version=1, edits=[{"old": "hello", "new": "hi"}], display="both", card_height="auto")
+    assert (res["display"], res["card_height"], res["version"]) == ("both", "auto", 2), res
+    bad = await tool("artifact_publish", artifact_id="mini", base_version=1, html="<p>tile</p>", card_height=5)
+    assert bad["error"] == "invalid", bad
+    listed = {a["id"]: a for a in (await tool("artifact_list"))["artifacts"]}
+    assert (listed["mini"]["display"], listed["mini"]["card_height"]) == ("card", 300) and listed["plain"]["display"] == "both", listed
+    meta = await tool("artifact_read", artifact_id="mini", metadata_only=True)
+    assert meta["display"] == "card" and meta["card_height"] == 300, meta
+    r = await ws("save", artifact_id="mini", html="<style>.x{height:900px}</style><p>tile</p>", base_version=1, display="page")
+    assert r["success"] and r["result"]["version"] == 1 and r["result"]["display"] == "page", r
+    await tool("artifact_publish", artifact_id="mini", base_version=1, html="<style>.x{height:900px}</style><p>tile</p>", display="card", card_height=300)
+    r = await ws("report", artifact_id="mini", version=1, source="dry-run", settled=True,
+                 frames=[{"w": 420, "h": 300, "content": 720}])
+    assert r["success"], r
+    res = await tool("artifact_check", artifact_id="mini", wait_seconds=0)
+    assert any(w["code"] == "card_overflow" for w in res["lint"]) and res["render"]["frames"] == [{"w": 420, "h": 300, "content": 720}], res
+    ok("display type: stored, listed, read, patched, validated, no new version for settings, card checked at its size")
+
     res = await tool("artifact_kv_set", artifact_id="cook", key="notes", value={"a": [1, 2]})
     res = await tool("artifact_kv_get", artifact_id="cook")
     assert res["values"] == {"notes": {"a": [1, 2]}}
