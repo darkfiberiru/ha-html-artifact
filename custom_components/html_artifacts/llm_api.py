@@ -110,6 +110,8 @@ window.ha API (all methods return promises unless noted)
                 marked skipped (not fired) if Next ends that step first. anchor:"timer" = fixed
                 offset from timer start, unaffected by overtime. A reminder can't have advance,
                 gate, duration, endLabel or after.
+        A manual step that is last in its lane and has a duration holds from its planned end until
+        Next (no closing marker step needed). Next on a step followed by a gate lands on the gate.
       view.reminders = [{index, label, state: pending|fired|skipped, due (seconds, null once
       done or before its step starts), armed, firedAt}] - show "Rice check - 2 min ago" chips.
       timer.step_log = [{index, track, label, planned, actual}] for every Next. reset() and

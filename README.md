@@ -43,7 +43,7 @@ update, with release notes and an **Install** button. After installing, restart 
 - **What counts as a new version:** the latest GitHub *release* if there is one, otherwise the `version` in
   `manifest.json` on the default branch. To ship an update, bump `version` in both `manifest.json` and `const.py`
   (a test fails if they differ) and push; optionally tag a release for release notes.
-- **With HACS**, versions come from GitHub *releases*, not from `manifest.json`. There are no releases yet, so HACS shows the latest commit hash instead of `0.8.0` until you publish one (Releases > Draft a new release, tag `v0.8.0`). Each later bump needs a new release for HACS to offer it as an update.
+- **With HACS**, versions come from GitHub *releases*, not from `manifest.json`. There are no releases yet, so HACS shows the latest commit hash instead of `0.8.1` until you publish one (Releases > Draft a new release, tag `v0.8.1`). Each later bump needs a new release for HACS to offer it as an update.
 - **HACS wins.** If HACS lists this repo as installed, the built-in updater doesn't create its entity (and removes an old one) so the two never disagree. Tick *Use the built-in updater even when HACS manages this integration* under **Configure** to override; it applies after a restart.
 - **Checked every 6 hours**, or run *Check for updates* on the entity.
 - Installing swaps `custom_components/html_artifacts` as a unit: the new copy is unpacked and validated first, and the old one is put back if the swap fails.
@@ -199,6 +199,10 @@ need to agree. The full reference Claude reads is `AUTHORING_GUIDE` in `llm_api.
   A reminder is only a timed alert plus a chip in `view.reminders`. It is never inferred from the order of manual and
   auto steps, and combining `reminder` with `advance`, `gate`, `duration`, `endLabel`, `after` or `remindEvery` is
   rejected with an `invalid` error.
+  A manual step that is the last one in its lane holds from its planned end (`at` + `duration`) until Next, so no
+  closing marker step is needed. Without a `duration` it has no planned end and the timer finishes at its `at`.
+  Next on a step that is followed by a check gate lands on the gate and asks it. A join step waits for every lane it
+  depends on to finish, including a lane still holding for Next.
   Only that step's lane waits. `timer.step_log` records planned vs actual per Next; `reset`/`start` restore the original
   schedule; `html_artifacts_timer_overtime` fires for automations.
 - **History.** `timer.history` records every start, pause, resume, extend, skip and answer (time, lane, step, source) and
