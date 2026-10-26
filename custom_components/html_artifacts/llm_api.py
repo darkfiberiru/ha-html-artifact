@@ -29,7 +29,11 @@ HTML ARTIFACTS FOR HOME ASSISTANT - AUTHORING GUIDE
 
 An artifact is one self-contained HTML page (inline CSS and JS) that you publish
 into Home Assistant. It is shown in a sidebar panel or dashboard card, in a
-sandboxed iframe, and can be edited by hand. Any kind of page is fine: trackers,
+sandboxed iframe, and can be edited by hand. Home Assistant is the display and the
+shared home of the page: it is used inside HA (panel or dashboard card, signed-in
+users only) and shared by everyone in the household who has HA access. There is no
+public link, so do not design a page to be opened outside HA, and do not rely on
+anything outside `window.ha` for state shared between devices. Any kind of page is fine: trackers,
 checklists, dashboards, kitchen displays, planners, games. Unlike a normal
 artifact, it can keep state on the server and use `window.ha` (below).
 
@@ -114,7 +118,9 @@ window.ha API (all methods return promises unless noted)
         Next (no closing marker step needed). Next on a step followed by a gate lands on the gate.
       view.reminders = [{index, label, state: pending|fired|skipped, due (seconds, null once
       done or before its step starts), armed, firedAt}] - show "Rice check - 2 min ago" chips.
-      timer.step_log = [{index, track, label, planned, actual}] for every Next. reset() and
+      timer.step_log = [{index, track, label, planned, actual}] for every Next.
+      timer.extra = [{index, track, label, gate, extend, seconds}]: time added to a step by gate
+      answers (gate) and by extend/+1 min (extend), including on auto steps. reset() and
       start() restore the schedule as created. Only the step's own lane holds.
       Bus: html_artifacts_timer_overtime {step, seconds_over, reminder}; reminders fire
       html_artifacts_timer_step with reminder:true. The phone's ongoing notification keeps the

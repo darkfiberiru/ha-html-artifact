@@ -15,7 +15,6 @@
   "use strict";
 
   const WS = "html_artifacts/";
-  const LS_LAST = "html_artifacts:last";
 
   // ------------------------------------------------------------------------
   // Helpers
@@ -1055,14 +1054,8 @@
         this._onLocation = () => this._openLinked();
         window.addEventListener("location-changed", this._onLocation);
         window.addEventListener("popstate", this._onLocation);
-        if (!(await this._openLinked())) {
-          const last = localStorage.getItem(LS_LAST);
-          const first = this._list.find((a) => a.id === last) || this._list[0];
-          if (first) {
-            await this._open(first.id);
-            this._setMode("view");
-          }
-        }
+        // Only a deep link opens a page on its own; otherwise the panel starts on the list.
+        if (!(await this._openLinked())) this._setMode("list");
       } catch (err) {
         this._toast("Could not load artifacts: " + (err.message || err.code));
       }
@@ -1198,7 +1191,6 @@
         return;
       }
       this._dirty = false;
-      localStorage.setItem(LS_LAST, id);
       this.$("editor").value = this._cur.html;
       this.$("title").value = this._cur.title;
       for (const el of ["editor", "title", "hist", "perms", "del", "edit", "full"]) this.$(el).disabled = false;
@@ -1541,7 +1533,7 @@
         return {
           id: "dry-run", artifact_id: art.id, label: (p && p.label) || "", state: "idle",
           duration: (p && p.duration) || 0, steps: (p && p.steps) || [], elapsed_now: 0, notify_targets: [],
-          remaining: 0, current_index: -1, next_index: null, next_in: 0, multi: false, tracks: [], join: null, waiting: [], reminders: [], history: [], overtime: 0, step_log: [],
+          remaining: 0, current_index: -1, next_index: null, next_in: 0, multi: false, tracks: [], join: null, waiting: [], reminders: [], history: [], overtime: 0, step_log: [], extra: [],
         };
       default:
         return null;

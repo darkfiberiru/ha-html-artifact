@@ -84,6 +84,11 @@ def run(browser, name, size, slot_css, narrow=False):
     page.goto("http://harness.test/")
     page.evaluate(f"mountPanel({str(narrow).lower()})")
     page.wait_for_timeout(600)
+    # the panel starts on the list and opens nothing by itself
+    start = page.evaluate("[window.panel.shadowRoot.querySelector('.app').dataset.mode, !!window.panel._cur]")
+    check(start == ["list", False], f"panel starts on the artifact list without opening one ({start})")
+    page.evaluate("window.panel.shadowRoot.querySelector('#list li[data-id]').click()")
+    page.wait_for_timeout(500)
     return page, errs
 
 

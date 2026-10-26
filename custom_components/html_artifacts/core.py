@@ -1065,11 +1065,26 @@ class TimerEngine(_Listeners):
             "history": copy.deepcopy(timer.get("history") or []),
             "overtime": max((v["overtime"] for v in views.values()), default=0.0),
             "step_log": copy.deepcopy(timer.get("step_log") or []),
+            "extra": self._extra_view(timer),
             "advance": timer.get("advance") or "auto",
             "planned_duration": timer.get("planned_duration", timer["duration"]),
             "started_wall": timer.get("started_wall"),
             "finished_wall": timer.get("finished_at"),
         }
+
+    def _extra_view(self, timer: dict) -> list[dict]:
+        """Time added per step: [{index, track, label, gate, extend, seconds}], in step order."""
+        out = []
+        for key in sorted(timer.get("extra") or {}, key=int):
+            row = timer["extra"][key]
+            if row["index"] >= len(timer["steps"]):
+                continue
+            out.append({
+                "index": row["index"], "track": row["track"] if timer.get("multi") else None,
+                "label": timer["steps"][row["index"]]["label"], "gate": row["gate"],
+                "extend": row["extend"], "seconds": round(row["gate"] + row["extend"], 3),
+            })
+        return out
 
     def list(self, artifact_id: str | None = None) -> list[dict]:
         timers = [
@@ -1531,6 +1546,16 @@ class TimerEngine(_Listeners):
             timer["steps"] = copy.deepcopy(timer["orig_steps"])
             timer["duration"] = timer.get("orig_duration", timer["duration"])
         timer["step_log"] = []
+        timer["extra"] = {}
+
+    @staticmethod
+    def _add_extra(timer: dict, tid: str | None, index: int | None, kind: str, seconds: float) -> None:
+        """Remember time added to a step by a gate answer ("gate") or +/- minutes ("extend")."""
+        if index is None or not seconds:
+            return
+        row = timer.setdefault("extra", {}).setdefault(
+            str(index), {"index": index, "track": tid, "gate": 0.0, "extend": 0.0})
+        row[kind] = round(row[kind] + seconds, 3)
 
     def _init_tstate(self, timer: dict) -> None:
         names = [t["id"] for t in timer["tracks"]]
@@ -1788,7 +1813,9 @@ class TimerEngine(_Listeners):
         for name in targets:
             self._shift_track(timer, name, seconds)
         self._fix_duration(timer, None if tid else seconds, big_t)
-        self._log(timer, "extend", now, seconds=seconds, track=tid, index=self._focus(timer, tid), source=source)
+        focus = self._focus(timer, tid)
+        self._add_extra(timer, tid, focus, "extend", seconds)
+        self._log(timer, "extend", now, seconds=seconds, track=tid, index=focus, source=source)
         self._save()
         self._arm(timer)
         self._emit_state(timer, "extend", track=tid)
@@ -1841,6 +1868,7 @@ class TimerEngine(_Listeners):
             ts["regates"].append({"index": index, "at": el + seconds})
             ts["offset"] += seconds
             self._fix_duration(timer)
+            self._add_extra(timer, tid, index, "gate", seconds)
         self._log(timer, "answer", now, track=tid, index=index, answer="yes" if seconds is None else seconds, source=source)
         return self._settle(timer, now, "answer", track=tid, index=index)
 

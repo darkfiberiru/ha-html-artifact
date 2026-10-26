@@ -167,5 +167,36 @@ class StepLogTest(unittest.TestCase):
         self.assertAlmostEqual(view["step_log"][0]["actual"], 160, delta=2)
 
 
+class ExtraTimeTest(unittest.TestCase):
+    def test_gate_answers_and_extends_are_summed_per_step(self):
+        engine, sched, _, events = make_engine()
+        steps = [
+            {"track": "fish", "at": 0, "label": "Simmer", "advance": "auto", "duration": 100},
+            {"track": "fish", "at": 100, "label": "Check", "gate": GATE},
+        ]
+        timer = engine.create("a", "x", steps, tracks=[{"id": "fish"}], start=True)
+        tid = timer["id"]
+        sched.advance(50)
+        engine.extend(tid, 30, track="fish")  # +30 on Simmer
+        sched.advance(90)  # gate at 130
+        engine.answer(tid, 1, 60)
+        sched.advance(70)  # gate again at 190
+        engine.answer(tid, 1, 120)
+        rows = {r["index"]: r for r in engine.get_view(tid)["extra"]}
+        self.assertEqual(rows[0]["extend"], 30)
+        self.assertEqual(rows[0]["label"], "Simmer")
+        self.assertEqual(rows[1]["gate"], 180)
+        self.assertEqual(rows[1]["seconds"], 180)
+
+    def test_reset_clears_it(self):
+        engine, sched, _, events = make_engine()
+        timer = engine.create("a", "x", [{"at": 0, "label": "A", "duration": 50}, {"at": 50, "label": "B"}], start=True)
+        sched.advance(10)
+        engine.extend(timer["id"], 20)
+        self.assertTrue(engine.get_view(timer["id"])["extra"])
+        engine.reset(timer["id"])
+        self.assertEqual(engine.get_view(timer["id"])["extra"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

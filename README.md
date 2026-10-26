@@ -25,6 +25,20 @@ trackers, kitchen displays, chore boards, planners, status walls, games.
                          └ sandboxed iframe, postMessage bridge = window.ha
 ```
 
+## Where an artifact is meant to be used
+
+Home Assistant is the **display and the shared home** of a page, not a publishing site.
+
+- **Display:** you open a page inside Home Assistant, in the **Artifacts** sidebar panel (on any device where you are
+  signed in to HA) or as a **dashboard card** on a wall tablet, phone or the HA app. That is where `window.ha` works.
+- **Sharing:** the household shares it by having an HA account. Everyone who opens the page sees the same version and
+  the same live state (`ha.kv`, timers), and what the page can touch is limited by the permissions you approved.
+- **Not a public link:** there is no public URL for a page, and `window.ha` does nothing outside Home Assistant. To
+  show it to someone with no HA account, give them access to HA or send them the HTML file, which opens as a plain
+  page without `window.ha`.
+- **Claude's side:** Claude publishes and edits pages over MCP or REST and never needs to see the display; it uses
+  `artifact_check` to see how a page renders.
+
 ## Install
 
 1. Copy `custom_components/html_artifacts` into your HA config, or add this repo to HACS as a custom repository.
@@ -43,7 +57,7 @@ update, with release notes and an **Install** button. After installing, restart 
 - **What counts as a new version:** the latest GitHub *release* if there is one, otherwise the `version` in
   `manifest.json` on the default branch. To ship an update, bump `version` in both `manifest.json` and `const.py`
   (a test fails if they differ) and push; optionally tag a release for release notes.
-- **With HACS**, versions come from GitHub *releases*, not from `manifest.json`. There are no releases yet, so HACS shows the latest commit hash instead of `0.8.1` until you publish one (Releases > Draft a new release, tag `v0.8.1`). Each later bump needs a new release for HACS to offer it as an update.
+- **With HACS**, versions come from GitHub *releases*, not from `manifest.json`. There are no releases yet, so HACS shows the latest commit hash instead of `0.8.2` until you publish one (Releases > Draft a new release, tag `v0.8.2`). Each later bump needs a new release for HACS to offer it as an update.
 - **HACS wins.** If HACS lists this repo as installed, the built-in updater doesn't create its entity (and removes an old one) so the two never disagree. Tick *Use the built-in updater even when HACS manages this integration* under **Configure** to override; it applies after a restart.
 - **Checked every 6 hours**, or run *Check for updates* on the entity.
 - Installing swaps `custom_components/html_artifacts` as a unit: the new copy is unpacked and validated first, and the old one is put back if the swap fails.
@@ -203,7 +217,7 @@ need to agree. The full reference Claude reads is `AUTHORING_GUIDE` in `llm_api.
   closing marker step is needed. Without a `duration` it has no planned end and the timer finishes at its `at`.
   Next on a step that is followed by a check gate lands on the gate and asks it. A join step waits for every lane it
   depends on to finish, including a lane still holding for Next.
-  Only that step's lane waits. `timer.step_log` records planned vs actual per Next; `reset`/`start` restore the original
+  Only that step's lane waits. `timer.step_log` records planned vs actual per Next, and `timer.extra` lists the time added per step by gate answers (`gate`) and +/- minutes (`extend`); `reset`/`start` restore the original
   schedule; `html_artifacts_timer_overtime` fires for automations.
 - **History.** `timer.history` records every start, pause, resume, extend, skip and answer (time, lane, step, source) and
   finished timers are kept for 7 days, so a page can log "planned 27 min, took 31". `html_artifacts_timer_finished`
@@ -229,7 +243,7 @@ Notifications go to the services chosen under **Configure**, or a persistent not
 
 ## The panel
 
-Open **Artifacts** in the sidebar. Picking an artifact shows the page **full size**; the toolbar has
+Open **Artifacts** in the sidebar. The panel opens on the **list of artifacts** and never opens one by itself. Picking an artifact shows the page **full size**; the toolbar has
 **Edit** (list, code editor and live preview side by side, with Save, history, Delete and Permissions),
 **Full screen** (hides Home Assistant's own chrome; **Esc** or the ✕ button exits) and **‹** back to the list.
 The orange *Needs approval* badge opens the permissions dialog.
