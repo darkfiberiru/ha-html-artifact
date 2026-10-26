@@ -58,6 +58,7 @@ CONTENT_TYPES = {
     ".json": "application/json",
     ".geojson": "application/geo+json",
     ".txt": "text/plain; charset=utf-8",
+    ".html": "text/html; charset=utf-8",  # a page to publish (html_asset); served sandboxed
     ".csv": "text/csv; charset=utf-8",
     ".md": "text/markdown; charset=utf-8",
     ".css": "text/css; charset=utf-8",
