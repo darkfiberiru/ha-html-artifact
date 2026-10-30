@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from homeassistant.components import frontend, panel_custom
+
+from . import resources as lovelace_resources
 from homeassistant.components.http import StaticPathConfig
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import Event, HomeAssistant, callback
@@ -158,7 +160,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         config={},
         embed_iframe=False,
     )
-    frontend.add_extra_js_url(hass, url)  # makes the dashboard card available
+    frontend.add_extra_js_url(hass, url)  # panel + a best-effort card load
+    # ...and as a Lovelace resource, which the dashboard loads before it
+    # builds cards. See resources.py for why extra_js_url alone is racy.
+    await lovelace_resources.async_sync(hass, url, f"{STATIC_URL}/{JS_FILE}")
 
     api = ArtifactsAPI(hass)
     try:
@@ -183,4 +188,5 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     url = hass.data[DOMAIN].pop("js_url", None)
     if url:
         frontend.remove_extra_js_url(hass, url)
+    await lovelace_resources.async_remove(hass, f"{STATIC_URL}/{JS_FILE}")
     return True
